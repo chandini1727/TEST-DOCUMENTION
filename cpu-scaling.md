@@ -1,44 +1,30 @@
-# Step-by-Step Runbook: Test 02 CPU & RAM Resource Scaling
+# Execution Steps: Test 02 - CPU & RAM Scaling on Restore
 
-This runbook contains all exact commands to execute and verify the two resource scaling test scenarios on `root@stg-nc-workload1-master-1`:
-1. **Scenario 1: Scale-Up (`4 CPU / 8Gi RAM`)** — Expanding resources beyond the original `2 CPU / 4Gi RAM` baseline.
-2. **Scenario 2: Scale-Down (`1 CPU / 100Mi RAM`)** — Constraining memory below the active 644 MiB snapshot footprint.
-
-Both tests restore directly from the snapshot captured via `SnapshotJob` `sj-airuntime-gpu-01`.
+Run these commands directly in your cluster master node terminal.
 
 ---
 
-## Step 0: Ensure GPU Claim is Free & Retrieve Snapshot SHA
+## Prerequisites: Verify Snapshot & Release GPU
 
-Before restoring either scenario, confirm the source pod is deleted (so `gpu-claim` is unbound) and retrieve the snapshot SHA256 checksum:
+The snapshot checkpoint is already stored on worker-3 at:
+`/var/lib/neev-checkpoint-scratch/gpu-gvisor-poc/sj-airuntime-gpu-01/checkpoint/`
+
+Delete the previous workload pod to free the RTX 5090 GPU:
 
 ```bash
-# 1. Ensure any previous test pods are cleaned up
 kubectl delete pod -n gpu-gvisor-poc airuntime-gpu-workload airuntime-gpu-scaled-up airuntime-gpu-scaled-down --force --grace-period=0 2>/dev/null || true
-
-# 2. Verify SnapshotJob sj-airuntime-gpu-01 is Ready
-kubectl get snapshotjob -n gpu-gvisor-poc sj-airuntime-gpu-01
-
-# 3. Retrieve SHA256 checksum into shell variable
-SHA=$(kubectl get snapshotjob -n gpu-gvisor-poc sj-airuntime-gpu-01 -o jsonpath='{.status.sha256}')
-echo "Snapshot SHA256: $SHA"
 ```
 
-*Expected output: A 64-character hex string (e.g., `499ec4fac7fe6e78...`)*
-
-> [!NOTE]
-> If `sj-airuntime-gpu-01` has not been taken yet, execute Steps 1–3 in `poc/airuntime-snapshot-reconciler/STEPS.md` first.
-
 ---
 
-## Scenario 1: Scale-Up Test (`4 CPU / 8Gi RAM`)
+## Part 1: Scale-Up Scenario (4 CPU / 8Gi RAM)
 
-### 1.1 Deploy Scaled-Up Pod
-
-Deploy the restored pod with upgraded resources (`requests.cpu: 4`, `requests.memory: 8Gi`):
-
+### 1. Prepare and Apply Scale-Up Pod Manifest
 ```bash
-cat << 'EOF' | sed "s/PASTE_SHA_HERE/$SHA/g" | kubectl apply -f -
+SHA="f8d06885f488a78d7f425da21ec613e3a5330604d7783b9b22c9926fe72dca9e"
+echo "Using Snapshot SHA256: $SHA"
+
+cat << 'EOF' > /tmp/airuntime-scale-up.yaml
 apiVersion: v1
 kind: Pod
 metadata:
@@ -79,38 +65,79 @@ spec:
     - -c
     - |
       export PATH=/opt/venv/bin:$PATH
-      cat << 'PYEOF' > /workspace/airuntime_gpu_workload.py
-      import os, sys, time, torch
+      /opt/venv/bin/pip install --quiet transformers
 
-      log_path = "/workspace/airuntime_gpu.log"
-      token_path = "/workspace/runtime-token.txt"
+      cat << 'PYEOF' > /workspace/real_llm_server.py
+      import http.server
+      import urllib.parse
+      import json
+      import time
+      import os
+      import torch
+      from transformers import pipeline
 
-      with open(token_path, "w") as f:
-          f.write("airuntime-gpu-session-active\n")
+      print(f"=== Starting Real GPT-2 LLM Server on RTX 5090 (PID={os.getpid()}) ===", flush=True)
 
-      print(f"=== AIRuntime GPU Workload Starting (PID={os.getpid()}) ===", flush=True)
-      dev = torch.device("cuda:0")
-      state = torch.zeros(64 * 1024 * 1024, dtype=torch.float32, device=dev)
+      print("Loading GPT-2 model into RTX 5090 VRAM...", flush=True)
+      generator = pipeline("text-generation", model="gpt2", device="cuda:0")
+      print("GPT-2 Loaded and Ready on GPU!", flush=True)
 
-      tick = 0
-      with open(log_path, "a") as f:
-          f.write(f"=== Session Initialized: PID={os.getpid()} ===\n")
+      request_counter = 0
 
-      while True:
-          tick += 1
-          state += 1.0
-          torch.cuda.synchronize()
-          sample = float(state[0].item())
-          allocated_mb = torch.cuda.memory_allocated(dev) / (1024 * 1024)
-          msg = f"[AIRUNTIME-GPU] tick={tick} sample={sample:.1f} VRAM={allocated_mb:.1f}MB time={time.time()}\n"
-          print(msg, end="", flush=True)
-          with open(log_path, "a") as f:
-              f.write(msg)
-              f.flush()
-          time.sleep(1)
+      class LLMHandler(http.server.BaseHTTPRequestHandler):
+          def do_GET(self):
+              global request_counter
+              parsed = urllib.parse.urlparse(self.path)
+
+              if parsed.path == "/health":
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.end_headers()
+                  data = {
+                      "status": "healthy",
+                      "model": "GPT-2 (Real Pretrained LLM)",
+                      "gpu": torch.cuda.get_device_name(0),
+                      "vram_allocated_mb": round(torch.cuda.memory_allocated(0) / (1024 * 1024), 1),
+                      "requests_served": request_counter
+                  }
+                  self.wfile.write(json.dumps(data, indent=2).encode())
+                  return
+
+              if parsed.path == "/generate":
+                  request_counter += 1
+                  params = urllib.parse.parse_qs(parsed.query)
+                  prompt = params.get("prompt", ["The future of computing is"])[0]
+
+                  t0 = time.time()
+                  # Generate real text using the GPU LLM!
+                  result = generator(prompt, max_length=45, do_sample=True, temperature=0.7)
+                  latency_ms = (time.time() - t0) * 1000
+
+                  generated_text = result[0]["generated_text"]
+
+                  response_data = {
+                      "request_id": request_counter,
+                      "input_prompt": prompt,
+                      "gpu_latency_ms": round(latency_ms, 2),
+                      "ai_generated_text": generated_text
+                  }
+
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.end_headers()
+                  self.wfile.write(json.dumps(response_data, indent=2).encode())
+                  print(f"[LLM-SERVER] Request #{request_counter} served in {latency_ms:.1f}ms: '{prompt}'", flush=True)
+                  return
+
+              self.send_response(404)
+              self.end_headers()
+
+      server = http.server.ThreadingHTTPServer(("0.0.0.0", 8000), LLMHandler)
+      print(">>> Real LLM Server listening on port 8000! <<<", flush=True)
+      server.serve_forever()
       PYEOF
 
-      exec python3 -u /workspace/airuntime_gpu_workload.py
+      exec /opt/venv/bin/python3 -u /workspace/real_llm_server.py
     env:
     - name: NVIDIA_VISIBLE_DEVICES
       value: void
@@ -133,59 +160,37 @@ spec:
       claims:
       - name: gpu
 EOF
+
+sed -i "s/PASTE_SHA_HERE/$SHA/g" /tmp/airuntime-scale-up.yaml
+kubectl apply -f /tmp/airuntime-scale-up.yaml
 ```
 
----
-
-### 1.2 Verify Scale-Up Resumption
-
-Stream logs to confirm execution resumes from the exact tick where it was paused:
-
+### 2. Wait for Running and Verify
 ```bash
-kubectl logs -f -n gpu-gvisor-poc airuntime-gpu-scaled-up
+kubectl get pod -n gpu-gvisor-poc airuntime-gpu-scaled-up -w
 ```
+*(Once Running, press `Ctrl+C`).*
 
-**Expected Log Stream:**
-```text
-[AIRUNTIME-GPU] tick=15 sample=15.0 VRAM=256.0MB time=1794305283.000729
-[AIRUNTIME-GPU] tick=16 sample=16.0 VRAM=256.0MB time=1794305284.0035625
-[AIRUNTIME-GPU] tick=17 sample=17.0 VRAM=256.0MB time=1794305285.0057042
-[AIRUNTIME-GPU] tick=18 sample=18.0 VRAM=256.0MB time=1794305286.0079675
-```
-
-**Confirm Allocated Resources via Pod Spec:**
+### 3. Verify Health and Query AI Model on Scaled-Up Pod
 ```bash
-kubectl get pod -n gpu-gvisor-poc airuntime-gpu-scaled-up -o jsonpath='{.spec.containers[0].resources}' | jq .
+POD_IP=$(kubectl get pod -n gpu-gvisor-poc airuntime-gpu-scaled-up -o jsonpath='{.status.podIP}')
+
+curl -s "http://$POD_IP:8000/health"
+curl -s "http://$POD_IP:8000/generate?prompt=Scaled%20up%20resources%20allow%20the%20AI%20model%20to"
 ```
 
-*Expected limits: `{"cpu": "4", "memory": "8Gi"}`*
-
----
-
-### 1.3 Clean Up Scale-Up Pod
-
-Delete the scale-up pod to release the RTX 5090 GPU for the scale-down test:
-
+### 4. Clean Up Scale-Up Pod (to Free GPU for Next Test)
 ```bash
 kubectl delete pod -n gpu-gvisor-poc airuntime-gpu-scaled-up --force --grace-period=0
 ```
 
-Wait until terminated:
-```bash
-kubectl get pod -n gpu-gvisor-poc airuntime-gpu-scaled-up
-```
-*Expected output: `NotFound`*
-
 ---
 
-## Scenario 2: Scale-Down Test (`1 CPU / 100Mi RAM`)
+## Part 2: Scale-Down Scenario (1 CPU / 100Mi RAM)
 
-### 2.1 Deploy Scaled-Down Pod
-
-Deploy the restored pod with constrained memory below the 644 MiB checkpoint footprint (`requests.memory: 100Mi`):
-
+### 1. Prepare and Apply Constrained Scale-Down Pod Manifest
 ```bash
-cat << 'EOF' | sed "s/PASTE_SHA_HERE/$SHA/g" | kubectl apply -f -
+cat << 'EOF' > /tmp/airuntime-scale-down.yaml
 apiVersion: v1
 kind: Pod
 metadata:
@@ -226,38 +231,79 @@ spec:
     - -c
     - |
       export PATH=/opt/venv/bin:$PATH
-      cat << 'PYEOF' > /workspace/airuntime_gpu_workload.py
-      import os, sys, time, torch
+      /opt/venv/bin/pip install --quiet transformers
 
-      log_path = "/workspace/airuntime_gpu.log"
-      token_path = "/workspace/runtime-token.txt"
+      cat << 'PYEOF' > /workspace/real_llm_server.py
+      import http.server
+      import urllib.parse
+      import json
+      import time
+      import os
+      import torch
+      from transformers import pipeline
 
-      with open(token_path, "w") as f:
-          f.write("airuntime-gpu-session-active\n")
+      print(f"=== Starting Real GPT-2 LLM Server on RTX 5090 (PID={os.getpid()}) ===", flush=True)
 
-      print(f"=== AIRuntime GPU Workload Starting (PID={os.getpid()}) ===", flush=True)
-      dev = torch.device("cuda:0")
-      state = torch.zeros(64 * 1024 * 1024, dtype=torch.float32, device=dev)
+      print("Loading GPT-2 model into RTX 5090 VRAM...", flush=True)
+      generator = pipeline("text-generation", model="gpt2", device="cuda:0")
+      print("GPT-2 Loaded and Ready on GPU!", flush=True)
 
-      tick = 0
-      with open(log_path, "a") as f:
-          f.write(f"=== Session Initialized: PID={os.getpid()} ===\n")
+      request_counter = 0
 
-      while True:
-          tick += 1
-          state += 1.0
-          torch.cuda.synchronize()
-          sample = float(state[0].item())
-          allocated_mb = torch.cuda.memory_allocated(dev) / (1024 * 1024)
-          msg = f"[AIRUNTIME-GPU] tick={tick} sample={sample:.1f} VRAM={allocated_mb:.1f}MB time={time.time()}\n"
-          print(msg, end="", flush=True)
-          with open(log_path, "a") as f:
-              f.write(msg)
-              f.flush()
-          time.sleep(1)
+      class LLMHandler(http.server.BaseHTTPRequestHandler):
+          def do_GET(self):
+              global request_counter
+              parsed = urllib.parse.urlparse(self.path)
+
+              if parsed.path == "/health":
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.end_headers()
+                  data = {
+                      "status": "healthy",
+                      "model": "GPT-2 (Real Pretrained LLM)",
+                      "gpu": torch.cuda.get_device_name(0),
+                      "vram_allocated_mb": round(torch.cuda.memory_allocated(0) / (1024 * 1024), 1),
+                      "requests_served": request_counter
+                  }
+                  self.wfile.write(json.dumps(data, indent=2).encode())
+                  return
+
+              if parsed.path == "/generate":
+                  request_counter += 1
+                  params = urllib.parse.parse_qs(parsed.query)
+                  prompt = params.get("prompt", ["The future of computing is"])[0]
+
+                  t0 = time.time()
+                  # Generate real text using the GPU LLM!
+                  result = generator(prompt, max_length=45, do_sample=True, temperature=0.7)
+                  latency_ms = (time.time() - t0) * 1000
+
+                  generated_text = result[0]["generated_text"]
+
+                  response_data = {
+                      "request_id": request_counter,
+                      "input_prompt": prompt,
+                      "gpu_latency_ms": round(latency_ms, 2),
+                      "ai_generated_text": generated_text
+                  }
+
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.end_headers()
+                  self.wfile.write(json.dumps(response_data, indent=2).encode())
+                  print(f"[LLM-SERVER] Request #{request_counter} served in {latency_ms:.1f}ms: '{prompt}'", flush=True)
+                  return
+
+              self.send_response(404)
+              self.end_headers()
+
+      server = http.server.ThreadingHTTPServer(("0.0.0.0", 8000), LLMHandler)
+      print(">>> Real LLM Server listening on port 8000! <<<", flush=True)
+      server.serve_forever()
       PYEOF
 
-      exec python3 -u /workspace/airuntime_gpu_workload.py
+      exec /opt/venv/bin/python3 -u /workspace/real_llm_server.py
     env:
     - name: NVIDIA_VISIBLE_DEVICES
       value: void
@@ -280,49 +326,21 @@ spec:
       claims:
       - name: gpu
 EOF
+
+sed -i "s/PASTE_SHA_HERE/$SHA/g" /tmp/airuntime-scale-down.yaml
+kubectl apply -f /tmp/airuntime-scale-down.yaml
 ```
 
----
+### 2. Observe Restore Rejection / Failure
+Because the snapshot memory footprint (~644MB) exceeds the 100Mi limit, containerd/gVisor cannot allocate the required pages:
 
-### 2.2 Inspect Pod Status & Failure Reason
-
-Check pod status:
 ```bash
 kubectl get pod -n gpu-gvisor-poc airuntime-gpu-scaled-down
-```
-
-*Status will be `StartError` or `CrashLoopBackOff`.*
-
-Inspect Kubelet failure events:
-```bash
 kubectl describe pod -n gpu-gvisor-poc airuntime-gpu-scaled-down | tail -n 25
 ```
 
-**Observed Rejection Output:**
-```text
-Events:
-  Type     Reason     Age   From     Message
-  ----     ------     ----  ----     -------
-  Warning  Failed     10s   kubelet  Error: failed to start containerd task "cuda": OCI runtime restore failed: starting container: systemd error: Unit cri-containerd-...scope failed to load properly, please adjust/correct and reload service manager: No such file or directory
-```
-
-**Why this failed:**
-The saved snapshot holds a 644 MiB memory footprint. When containerd/gVisor configures cgroups for the new container with a 100 MiB limit, the memory allocator rejects loading the 644 MiB memory state, terminating the container immediately.
-
----
-
-### 2.3 Clean Up Scale-Down Pod
-
+### 3. Clean Up Scale-Down Pod
 ```bash
 kubectl delete pod -n gpu-gvisor-poc airuntime-gpu-scaled-down --force --grace-period=0
 ```
-
----
-
-## Summary of Results
-
-| Scenario | Limits Tested | Outcome | Observation |
-| :--- | :--- | :---: | :--- |
-| **Scale-Up** | 4 CPU / 8Gi RAM | ✅ **PASSED** | Workload seamlessly resumed at `tick=15` with expanded resources; 256MB VRAM was intact. |
-| **Scale-Down** | 1 CPU / 100Mi RAM | ❌ **FAILED** | Container refused to load; memory limit (100Mi) was lower than active snapshot memory (644Mi). |
 
