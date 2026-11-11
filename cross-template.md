@@ -1,40 +1,31 @@
-# Step-by-Step Runbook: Test 03 Cross-Template Compatibility
+# Execution Steps: Test 03 - Cross-Template Compatibility on Restore
 
-This runbook contains all exact commands to execute and verify the cross-template restore test scenario on `root@stg-nc-workload1-master-1`.
-
-### Objective:
-Verify whether a snapshot captured from the PyTorch GPU template (`pytorch-v2.8.0-ubuntu-24.04:0.1.2`) can be restored into a pod provisioned with a different base image (`ubuntu-24.04:0.1.3`, which lacks CUDA and PyTorch virtual environments).
-
-This test restores directly from the snapshot captured via `SnapshotJob` `sj-airuntime-gpu-01`.
+Run these commands directly in your cluster master node terminal.
 
 ---
 
-## Step 0: Ensure GPU Claim is Free & Retrieve Snapshot SHA
+## Prerequisites: Verify Snapshot & Release GPU
 
-Confirm any previous test pods are cleaned up (so `gpu-claim` is unbound) and retrieve the snapshot SHA256 checksum:
+The snapshot checkpoint is already stored on worker-3 at:
+`/var/lib/neev-checkpoint-scratch/gpu-gvisor-poc/sj-airuntime-gpu-01/checkpoint/`
+
+Delete previous pods to free the RTX 5090 GPU:
 
 ```bash
-# 1. Clean up any leftover test pods
-kubectl delete pod -n gpu-gvisor-poc airuntime-gpu-workload airuntime-gpu-scaled-up airuntime-gpu-scaled-down airuntime-gpu-cross-template --force --grace-period=0 2>/dev/null || true
-
-# 2. Confirm SnapshotJob sj-airuntime-gpu-01 exists and is Ready
-kubectl get snapshotjob -n gpu-gvisor-poc sj-airuntime-gpu-01
-
-# 3. Retrieve SHA256 checksum into shell variable
-SHA=$(kubectl get snapshotjob -n gpu-gvisor-poc sj-airuntime-gpu-01 -o jsonpath='{.status.sha256}')
-echo "Snapshot SHA256: $SHA"
+kubectl delete pod -n gpu-gvisor-poc airuntime-gpu-workload airuntime-gpu-cross-template --force --grace-period=0 2>/dev/null || true
 ```
-
-*Expected output: A 64-character hex string (e.g., `499ec4fac7fe6e78...`)*
 
 ---
 
 ## Step 1: Deploy Cross-Template Restore Pod
 
-Deploy the restored pod pointing to the target image `harbor.neev.work/test-template/ubuntu-24.04:0.1.3`:
+Deploy the restored pod pointing to the base Ubuntu 24.04 image (`harbor.neev.work/test-template/ubuntu-24.04:0.1.3`) instead of the original PyTorch image:
 
 ```bash
-cat << 'EOF' | sed "s/PASTE_SHA_HERE/$SHA/g" | kubectl apply -f -
+SHA="f8d06885f488a78d7f425da21ec613e3a5330604d7783b9b22c9926fe72dca9e"
+echo "Using Snapshot SHA256: $SHA"
+
+cat << 'EOF' > /tmp/airuntime-cross-template.yaml
 apiVersion: v1
 kind: Pod
 metadata:
@@ -76,38 +67,79 @@ spec:
     - -c
     - |
       export PATH=/opt/venv/bin:$PATH
-      cat << 'PYEOF' > /workspace/airuntime_gpu_workload.py
-      import os, sys, time, torch
+      /opt/venv/bin/pip install --quiet transformers
 
-      log_path = "/workspace/airuntime_gpu.log"
-      token_path = "/workspace/runtime-token.txt"
+      cat << 'PYEOF' > /workspace/real_llm_server.py
+      import http.server
+      import urllib.parse
+      import json
+      import time
+      import os
+      import torch
+      from transformers import pipeline
 
-      with open(token_path, "w") as f:
-          f.write("airuntime-gpu-session-active\n")
+      print(f"=== Starting Real GPT-2 LLM Server on RTX 5090 (PID={os.getpid()}) ===", flush=True)
 
-      print(f"=== AIRuntime GPU Workload Starting (PID={os.getpid()}) ===", flush=True)
-      dev = torch.device("cuda:0")
-      state = torch.zeros(64 * 1024 * 1024, dtype=torch.float32, device=dev)
+      print("Loading GPT-2 model into RTX 5090 VRAM...", flush=True)
+      generator = pipeline("text-generation", model="gpt2", device="cuda:0")
+      print("GPT-2 Loaded and Ready on GPU!", flush=True)
 
-      tick = 0
-      with open(log_path, "a") as f:
-          f.write(f"=== Session Initialized: PID={os.getpid()} ===\n")
+      request_counter = 0
 
-      while True:
-          tick += 1
-          state += 1.0
-          torch.cuda.synchronize()
-          sample = float(state[0].item())
-          allocated_mb = torch.cuda.memory_allocated(dev) / (1024 * 1024)
-          msg = f"[AIRUNTIME-GPU] tick={tick} sample={sample:.1f} VRAM={allocated_mb:.1f}MB time={time.time()}\n"
-          print(msg, end="", flush=True)
-          with open(log_path, "a") as f:
-              f.write(msg)
-              f.flush()
-          time.sleep(1)
+      class LLMHandler(http.server.BaseHTTPRequestHandler):
+          def do_GET(self):
+              global request_counter
+              parsed = urllib.parse.urlparse(self.path)
+
+              if parsed.path == "/health":
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.end_headers()
+                  data = {
+                      "status": "healthy",
+                      "model": "GPT-2 (Real Pretrained LLM)",
+                      "gpu": torch.cuda.get_device_name(0),
+                      "vram_allocated_mb": round(torch.cuda.memory_allocated(0) / (1024 * 1024), 1),
+                      "requests_served": request_counter
+                  }
+                  self.wfile.write(json.dumps(data, indent=2).encode())
+                  return
+
+              if parsed.path == "/generate":
+                  request_counter += 1
+                  params = urllib.parse.parse_qs(parsed.query)
+                  prompt = params.get("prompt", ["The future of computing is"])[0]
+
+                  t0 = time.time()
+                  # Generate real text using the GPU LLM!
+                  result = generator(prompt, max_length=45, do_sample=True, temperature=0.7)
+                  latency_ms = (time.time() - t0) * 1000
+
+                  generated_text = result[0]["generated_text"]
+
+                  response_data = {
+                      "request_id": request_counter,
+                      "input_prompt": prompt,
+                      "gpu_latency_ms": round(latency_ms, 2),
+                      "ai_generated_text": generated_text
+                  }
+
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.end_headers()
+                  self.wfile.write(json.dumps(response_data, indent=2).encode())
+                  print(f"[LLM-SERVER] Request #{request_counter} served in {latency_ms:.1f}ms: '{prompt}'", flush=True)
+                  return
+
+              self.send_response(404)
+              self.end_headers()
+
+      server = http.server.ThreadingHTTPServer(("0.0.0.0", 8000), LLMHandler)
+      print(">>> Real LLM Server listening on port 8000! <<<", flush=True)
+      server.serve_forever()
       PYEOF
 
-      exec python3 -u /workspace/airuntime_gpu_workload.py
+      exec /opt/venv/bin/python3 -u /workspace/real_llm_server.py
     env:
     - name: NVIDIA_VISIBLE_DEVICES
       value: void
@@ -123,63 +155,45 @@ spec:
     resources:
       requests:
         cpu: "2"
-        memory: "4Gi"
+        memory: "6Gi"
       limits:
         cpu: "2"
-        memory: "4Gi"
+        memory: "6Gi"
       claims:
       - name: gpu
 EOF
+
+sed -i "s/PASTE_SHA_HERE/$SHA/g" /tmp/airuntime-cross-template.yaml
+kubectl apply -f /tmp/airuntime-cross-template.yaml
 ```
 
 ---
 
-## Step 2: Inspect Pod Status & Rejection Events
+## Step 2: Observe Failure & Incompatible Rootfs Rejection
 
-Check the pod status:
+Watch the pod status. It enters `StartError` because gVisor's kernel verifies that the container rootfs matches the open file descriptors of the checkpointed process:
+
 ```bash
 kubectl get pod -n gpu-gvisor-poc airuntime-gpu-cross-template
+kubectl describe pod -n gpu-gvisor-poc airuntime-gpu-cross-template | tail -n 25
 ```
 
-*Expected Status: `StartError` or `CrashLoopBackOff`.*
-
-Inspect Kubelet failure events:
-```bash
-kubectl describe pod -n gpu-gvisor-poc airuntime-gpu-cross-template | grep -E "Warning|Failed|Error"
-```
-
-**Observed Rejection Output:**
+**Observed Output & Event:**
 ```text
-Status:              Failed
-      Reason:   StartError
-  Warning  Failed   8s   kubelet  spec.containers{cuda}: Error: failed to start containerd task "cuda": 
-OCI runtime restore failed: starting container: starting sub-container: 
-failed to handle restore spec validation: failed to validate restore spec: 
-failed to validate spec for container "cuda": 
-"Mounts" does not match across checkpoint restore for container: "agent"
+NAME                           READY   STATUS       RESTARTS   AGE
+airuntime-gpu-cross-template   0/1     StartError   0          12s
+
+Events:
+  Warning  Failed  kubelet  spec.containers{cuda}: Error: failed to start containerd task "cuda": OCI runtime restore failed: starting container: starting sub-container: failed to load kernel: vfs.CompleteRestore() failed: failed to complete restore for filesystem type "9p": failed to walk "opt/venv" of type 040000 in mount "cuda:/": no such file or directory
 ```
 
----
-
-## Step 3: Why This Failed (The Invariant)
-
-1. When `runsc checkpoint` runs, the container's entire rootfs overlay structure, paths, and mounts are saved into `checkpoint.img`.
-2. Upon restore, gVisor's validator verifies that the new container template matches the recorded image filesystem and mount topology.
-3. Because `ubuntu-24.04:0.1.3` has different rootfs layers, directory inodes, and lacks the CUDA/PyTorch paths present in `pytorch:0.1.2`, gVisor flags `"Mounts" does not match` and halts restoration before running any code.
+> **Why It Failed:** The snapshot was created in an environment where `/opt/venv` existed on the root filesystem. When restoring into the base Ubuntu image (`ubuntu-24.04:0.1.3`), gVisor's virtual file system (`vfs.CompleteRestore()`) attempted to remap the active Python virtualenv directory. Because `ubuntu-24.04:0.1.3` does not contain `/opt/venv`, gVisor refused to start a corrupted container state.
 
 ---
 
-## Step 4: Clean Up Pod
-
-Delete the failed cross-template pod:
+## Step 3: Clean Up Cross-Template Pod
 
 ```bash
 kubectl delete pod -n gpu-gvisor-poc airuntime-gpu-cross-template --force --grace-period=0
 ```
-
-Verify clean state:
-```bash
-kubectl get pod -n gpu-gvisor-poc airuntime-gpu-cross-template
-```
-*Expected output: `NotFound`*
 
