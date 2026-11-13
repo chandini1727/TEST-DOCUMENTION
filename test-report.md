@@ -80,7 +80,16 @@ runsc --root /run/containerd/runsc/k8s.io checkpoint \
 
 #### Restore Process
 
-When a restore is requested, the platform retrieves the snapshot from S3 and reloads the container and GPU memory. The workload immediately resumes running from the exact point it was paused, with all active processes, model weights, and GPU contexts intact.
+When a user resumes a workload, the platform uses the snapshot ID to retrieve the saved S3 archive and restore the Pod:
+
+1. **Fetch Snapshot Metadata:** The platform queries the snapshot ID to retrieve the S3 archive URI and SHA256 checksum.
+2. **Schedule Pod & Attach GPU:** The restore Pod is scheduled onto the GPU worker node, and NVIDIA DRA assigns the physical GPU device.
+3. **Download Snapshot (CSI Driver):** The `checkpoint.csi.neev.io` driver downloads the snapshot archive from S3 directly to the node and verifies its SHA256 checksum.
+4. **Validate Container Spec:** gVisor confirms that the container's command, arguments, and volume mounts match the saved checkpoint.
+5. **Restore Memory & GPU VRAM:** gVisor re-populates system RAM and GPU VRAM, reconstructing the exact process state, model weights, and execution context.
+6. **Workload Resumes:** The Pod transitions to `Running` in 16 to 26 seconds with zero cold-start delay, picking up execution exactly where it was paused.
+
+**Important:** The container specification (arguments and mounts) must match the checkpoint 1:1, and the Pod must be scheduled onto the same physical GPU card. Any deviation in arguments triggers an `Args does not match` error, and restoring to a different card causes a device ID mismatch.
 
 ---
 
