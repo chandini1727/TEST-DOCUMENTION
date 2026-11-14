@@ -1,22 +1,56 @@
-# Step-by-Step Runbook: Test 05 Template Version Upgrade (v0.1.1 ➡️ v0.1.2)
+# Test 05: Template Version Upgrade (v0.1.1 ➡️ v0.1.2)
 
-This runbook contains all exact commands to execute and verify that a workload snapshot captured on an earlier container template (`pytorch:0.1.1`) can be restored onto an upgraded patch version (`pytorch:0.1.2`) on `root@stg-nc-workload1-master-1`.
+This test evaluates whether a running GPU PyTorch workload snapshotted on an earlier container image template (`pytorch-v2.8.0-ubuntu-24.04:0.1.1`) can be restored onto an upgraded patch/minor version (`pytorch-v2.8.0-ubuntu-24.04:0.1.2`).
+
+This capability allows the platform to perform image upgrades, minor package updates, and security patches without invalidating customer checkpoints.
 
 ---
 
-## Step 0: Clean Up Previous Test State
+## Step 0: Clean Up Previous Resources & Free the GPU
+
+Run this first to clean up any lingering pods and snapshot jobs:
 
 ```bash
 # 1. Clean up pods from previous tests
-kubectl delete pod -n gpu-gvisor-poc airuntime-gpu-workload airuntime-gpu-scaled-up airuntime-gpu-scaled-down airuntime-gpu-cross-template neev-gpu-ceph-workload neev-gpu-ceph-restore-clone neev-gpu-ceph-restore-paused neev-gpu-upgrade-source neev-gpu-upgrade-restore --force --grace-period=0 2>/dev/null || true
+kubectl delete pods -n gpu-gvisor-poc --all --force --grace-period=0 2>/dev/null || true
 
-# 2. Delete any old upgrade snapshotjobs
-kubectl delete snapshotjob -n gpu-gvisor-poc sj-version-upgrade 2>/dev/null || true
+# 2. Delete existing snapshot jobs
+kubectl delete snapshotjob -n gpu-gvisor-poc --all 2>/dev/null || true
+
+# 3. Delete old resource claim to reset it cleanly
+kubectl delete resourceclaim -n gpu-gvisor-poc gpu-claim 2>/dev/null || true
+
+kubectl get pods,snapshotjob,resourceclaims -n gpu-gvisor-poc
 ```
 
 ---
 
-## Step 1: Deploy Source Pod on Template v0.1.1
+## Step 1: Create DRA GPU Claim (`gpu-claim`)
+
+```bash
+cat << 'EOF' | kubectl apply -f -
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: gpu-claim
+  namespace: gpu-gvisor-poc
+spec:
+  devices:
+    requests:
+    - name: gpu
+      exactly:
+        allocationMode: ExactCount
+        count: 1
+        deviceClassName: gpu.nvidia.com
+        selectors:
+        - cel:
+            expression: "has(device.attributes['gpu.nvidia.com'].uuid) && device.attributes['gpu.nvidia.com'].uuid == 'GPU-36df8b09-2435-5c42-7324-850c168ecc94'"
+EOF
+```
+
+---
+
+## Step 2: Deploy Source Pod on Template v0.1.1
 
 Deploy the source pod using image `harbor.neev.work/test-template/pytorch-v2.8.0-ubuntu-24.04:0.1.1`:
 
@@ -104,11 +138,11 @@ Monitor logs to confirm the source workload is actively computing on the GPU:
 ```bash
 kubectl logs -f -n gpu-gvisor-poc neev-gpu-upgrade-source
 ```
-*(Press `Ctrl+C` after seeing 5–10 ticks)*.
+*(Press `Ctrl+C` after seeing 5–10 ticks).*
 
 ---
 
-## Step 2: Trigger Snapshot via SnapshotJob Reconciler
+## Step 3: Trigger Snapshot via SnapshotJob Reconciler
 
 Trigger the snapshot targeting `neev-gpu-upgrade-source`:
 
@@ -132,7 +166,7 @@ Wait until `Ready`:
 ```bash
 kubectl get snapshotjob -n gpu-gvisor-poc sj-version-upgrade -w
 ```
-*(Takes ~5–8 seconds, press `Ctrl+C` once Phase shows `Ready`)*.
+*(Press `Ctrl+C` once Phase shows `Ready`).*
 
 Retrieve the snapshot SHA256 checksum:
 ```bash
@@ -142,7 +176,7 @@ echo "Snapshot SHA256: $SHA"
 
 ---
 
-## Step 3: Delete Source Pod to Release GPU Claim
+## Step 4: Delete Source Pod to Release GPU Claim
 
 ```bash
 kubectl delete pod -n gpu-gvisor-poc neev-gpu-upgrade-source --force --grace-period=0
@@ -156,7 +190,7 @@ kubectl get pod -n gpu-gvisor-poc neev-gpu-upgrade-source
 
 ---
 
-## Step 4: Deploy Restore Pod on Upgraded Template v0.1.2
+## Step 5: Deploy Restore Pod on Upgraded Template v0.1.2
 
 Deploy the restore pod referencing the upgraded template image `harbor.neev.work/test-template/pytorch-v2.8.0-ubuntu-24.04:0.1.2`:
 
@@ -196,6 +230,7 @@ spec:
         sha256: "PASTE_SHA_HERE"
   containers:
   - name: cuda
+    # Upgraded template v0.1.2 restoring from v0.1.1 snapshot
     image: harbor.neev.work/test-template/pytorch-v2.8.0-ubuntu-24.04:0.1.2
     command:
     - /bin/bash
@@ -245,9 +280,15 @@ spec:
 RESTORE_EOF
 ```
 
+Wait until Running:
+```bash
+kubectl get pod -n gpu-gvisor-poc neev-gpu-upgrade-restore -w
+```
+*(Press `Ctrl+C` once `Running`).*
+
 ---
 
-## Step 5: Verify Restored Workload Execution
+## Step 6: Verify Restored Workload Execution
 
 Stream logs from the restored pod:
 
@@ -270,10 +311,10 @@ kubectl logs -f -n gpu-gvisor-poc neev-gpu-upgrade-restore
 
 ---
 
-## Step 6: Clean Up Test 05
+## Step 7: Final Cleanup
 
 ```bash
-kubectl delete pod -n gpu-gvisor-poc neev-gpu-upgrade-restore --force --grace-period=0
-kubectl delete snapshotjob -n gpu-gvisor-poc sj-version-upgrade
+kubectl delete pod -n gpu-gvisor-poc neev-gpu-upgrade-restore --force --grace-period=0 2>/dev/null || true
+kubectl delete snapshotjob -n gpu-gvisor-poc sj-version-upgrade 2>/dev/null || true
 ```
 
