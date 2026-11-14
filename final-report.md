@@ -2,16 +2,15 @@
 
 ## 1. Executive Summary
 
-This Proof of Concept (PoC) evaluates whether the existing `sandbox-sr-operator` snapshot reconciler and `checkpoint-csi-driver` restore mechanism can support checkpoint and restore operations for GPU-based workloads under gVisor using the `runsc-root-self` runtime class (`overlay2 = "root:self"`).
+This Proof of Concept (PoC) evaluates whether the existing `sandbox-sr-operator` snapshot reconciler and `checkpoint-csi-driver` restore mechanism can support checkpoint and restore operations for GPU-based workloads under gVisor using the `runsc-root-self` runtime class.
 
 | What Was Tested | Test Configuration & Scope | Result | Key Finding / Observation |
 |---|---|:---:|---|
-| **PyTorch Training Loop** | Resuming active training loops to convergence without progress or data loss | **PASS** | Captured in **27.7 s**, restored in **16.6 s**; resumed seamlessly at next iteration with complete model convergence. |
+| **PyTorch Training Loop** | In-flight training checkpoint and seamless resume with zero progress loss | **PASS** | Captured in **27.7 s**, restored in **16.6 s**; resumed seamlessly at the next iteration with all model weights and progress intact. |
 | **vLLM Model Serving & KV Cache** | Active model serving and GPU memory across single vs. multi-process modes | **PARTIAL** | Succeeds in single-process mode with 32 GiB RAM (restores in 26 s with <80 ms response). Fails in multi-process setups or when host RAM is less than GPU memory. |
 | **ComfyUI Workspace** | Resuming active ComfyUI without restarting the server or reloading models | **PASS** | Captured in **19.1 s**, restored in **20.1 s**; web UI on port 3000 was immediately accessible (HTTP 200) with zero reload delay. |
 | **Resource Scaling on Restore** | Dynamic CPU/RAM scale-up (4 CPU / 8 GiB) vs scale-down (1 CPU / 100 MiB) | **PARTIAL** | Scale-up succeeded in 22 s; scale-down failed with OOM (`container in state stopped`). |
 | **Template Compatibility** | In-place version upgrade (`0.1.1` to `0.1.2`) vs cross-template restore | **PARTIAL** | Version upgrade resumed computation seamlessly in 18 s; cross-template failed on missing `/opt/venv`. |
-| **Storage Consistency (Ceph PVC)** | Persistent workspace writes during live checkpoint vs coordinated pre-pause | **PARTIAL** | Live snapshot caused disk drift past memory; pre-pause eliminated drift completely. |
 | **Hardware Device Affinity** | Restoring checkpoint onto a different physical GPU card (`Card 1` $\to$ `Card 0`) | **FAIL** | `nvproxy` failed with `NV0000_CTRL_CMD_GPU_GET_ID_INFO status=0x1f`. Device pinning required. |
 | **CUDA Checkpoint Config** | Checkpoint execution without `--cuda-checkpoint-path` flag | **FAIL** | `nvproxy.beforeSave()` rejected capture; utility path is strictly mandatory. |
 | **Multi-GPU Workload Restore** | Dual-GPU allocation, computation, checkpointing, and restore | **FAIL** | Dual-GPU execution and checkpoint succeeded in 10 s, but restore failed during driver initialization (`status=0x1f`). Multi-GPU workloads cannot be resumed. |
@@ -81,7 +80,16 @@ runsc --root /run/containerd/runsc/k8s.io checkpoint \
 
 #### Restore Process
 
-When a restore is requested, the platform retrieves the snapshot from S3 and reloads the container and GPU memory. The workload immediately resumes running from the exact point it was paused, with all active processes, model weights, and GPU contexts intact.
+When a user resumes a workload, the platform uses the snapshot ID to retrieve the saved S3 archive and restore the Pod:
+
+1. **Fetch Snapshot Metadata:** The platform queries the snapshot ID to retrieve the S3 archive URI and SHA256 checksum.
+2. **Schedule Pod & Attach GPU:** The restore Pod is scheduled onto the GPU worker node, and NVIDIA DRA assigns the physical GPU device.
+3. **Download Snapshot (CSI Driver):** The `checkpoint.csi.neev.io` driver downloads the snapshot archive from S3 directly to the node and verifies its SHA256 checksum.
+4. **Validate Container Spec:** gVisor confirms that the container's command, arguments, and volume mounts match the saved checkpoint.
+5. **Restore Memory & GPU VRAM:** gVisor re-populates system RAM and GPU VRAM, reconstructing the exact process state, model weights, and execution context.
+6. **Workload Resumes:** The Pod transitions to `Running` in 16 to 26 seconds with zero cold-start delay, picking up execution exactly where it was paused.
+
+**Important:** The container specification (arguments and mounts) must match the checkpoint 1:1, and the Pod must be scheduled onto the same physical GPU card. Any deviation in arguments triggers an `Args does not match` error, and restoring to a different card causes a device ID mismatch.
 
 ---
 
@@ -99,7 +107,7 @@ To verify that an actively running PyTorch neural network training workload on a
 2. **Capture Mid-Training Checkpoint:** While training was actively in-flight, a snapshot was triggered using `SnapshotJob`. gVisor and the reconciler captured the complete process memory and GPU VRAM state to S3 in **27.68 seconds**.
 3. **Delete Source Workload:** The running source Pod was deleted (`kubectl delete pod --force`), releasing 100% of the physical RTX 5090 GPU back to the cluster pool (0 MB VRAM occupied).
 4. **Restore Workload:** A restored Pod was deployed from the snapshot archive. The `checkpoint.csi.neev.io` driver downloaded the state from S3, and the workload reached `Running` state in **16.61 seconds**.
-5. **Verify Continuity:** The restored workload automatically resumed training from the exact iteration where it was paused, completed training to target convergence (`Loss < 0.005`), and successfully output final test predictions with zero progress lost.
+5. **Verify Continuity:** The restored workload automatically resumed training from the exact iteration where it was paused, completed training successfully (`Loss < 0.005`), and output final test predictions with zero progress lost.
 
 **Observed Timing Metrics**
 
