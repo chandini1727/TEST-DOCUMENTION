@@ -22,23 +22,23 @@ Before gVisor snapshots the container, the CUDA checkpoint step copies GPU memor
 
 ### Approach A: CUDA suspension with device remapping
 
-**Overview:** Before taking the snapshot, we use `cuda-checkpoint` to lock and suspend CUDA on the GPU. This moves all GPU memory into the process's CPU RAM, so the snapshot holds the full GPU state. On resume, the container is restored with CUDA still suspended, the free target GPU is attached, and CUDA state is rebuilt on that GPU by mapping the source GPU UUID to the target one. Weights and all GPU memory are kept, so nothing is reloaded from disk.
+**Overview:** This approach suspends CUDA at the driver level, so the workload needs no changes. Before the snapshot, `cuda-checkpoint` locks the process's CUDA context and suspends it. Suspending copies all GPU memory into the process's CPU RAM and closes every handle to the physical GPU, so the snapshot holds the full GPU state as ordinary host memory. On resume, the container is restored with CUDA still suspended, a free target GPU is attached, and `cuda-checkpoint` rebuilds the CUDA state on that GPU by mapping the source GPU UUID to the target GPU UUID. All GPU memory, including model weights, is preserved, so nothing is reloaded from disk.
 
 #### Steps
 
 **1. Deploy the workload on the source GPU.**
-Create the pod with a GPU claim for GPU 0 and the `cuda-checkpoint` binary mounted from the host. The pod loads the `Qwen2.5-7B` model and starts the LoRA fine-tune.
+Create the pod with a GPU claim for GPU 0 and mount the `cuda-checkpoint` binary from the host. The pod loads the `Qwen2.5-7B` model and starts the LoRA fine-tune.
 
 ```bash
 kubectl apply -f train-a-source.yaml
 kubectl logs -n gpu-gvisor-poc lora-source -f
 ```
 
-**2. Load the model into the GPU.**
-The pod loads the `Qwen2.5-7B` model into GPU 0 memory and training starts on the GPU.
+**2. Confirm the model is loaded on the GPU.**
+Wait until the `Qwen2.5-7B` weights are resident in GPU 0 memory and the training log shows steps progressing.
 
 **3. Suspend CUDA and verify.**
-Run `cuda-checkpoint` against the process that owns the CUDA context (PID 1 for single-process training). The `lock` action blocks new CUDA calls, and the `checkpoint` action suspends CUDA immediately. On suspend, the full contents of GPU memory are copied into the process's CPU RAM and all handles to the physical GPU are closed, leaving the GPU free.
+Run `cuda-checkpoint` against the process that owns the CUDA context (PID 1 for single-process training). The `lock` action blocks new CUDA calls, and the `checkpoint` action suspends CUDA. On suspend, the full contents of GPU memory are copied into the process's CPU RAM and all handles to the physical GPU are closed, leaving the GPU free.
 
 ```bash
 # 1. Lock CUDA execution
@@ -78,7 +78,7 @@ kubectl apply -f lora-restore.yaml
 ```
 
 **6. Resume CUDA on the new GPU.**
-Map the source GPU UUID to the target GPU UUID, then unlock.
+Restore the CUDA state with the source GPU UUID mapped to the target GPU UUID, then unlock the process so CUDA calls can proceed.
 
 ```bash
 kubectl exec -n gpu-gvisor-poc lora-restore -- /opt/cuda-checkpoint/cuda-checkpoint \
@@ -89,7 +89,7 @@ kubectl exec -n gpu-gvisor-poc lora-restore -- /opt/cuda-checkpoint/cuda-checkpo
 ```
 
 **7. Verify.**
-Training continues from the step after the pause, with no model reload.
+Confirm in the logs that training continues from the step after the pause, with no model reload.
 
 ```bash
 kubectl logs -n gpu-gvisor-poc lora-restore -f
@@ -109,17 +109,17 @@ kubectl logs -n gpu-gvisor-poc lora-restore -f
 
 #### Why vLLM fails
 
-vLLM runs multiple processes on the GPU: the API server and the engine (`VLLM::EngineCore`). Each one holds its own CUDA context and GPU handles, and they talk to each other over a socket. `cuda-checkpoint` works on one process at a time (`--pid`), so suspending one process releases only that process's GPU handles, not the whole GPU.
+vLLM runs as multiple processes on the GPU: the API server and the engine (`VLLM::EngineCore`). Each holds its own CUDA context and GPU handles, and they communicate over a socket. `cuda-checkpoint` operates on one process at a time (`--pid`), so suspending one process releases only that process's GPU handles, not the whole GPU.
 
-**Case 1: only one process suspended. The checkpoint fails.**
-The other process still has its GPU handles open. gVisor cannot save an open GPU handle in the snapshot, so the checkpoint stops:
+**Case 1: only one process is suspended, and the checkpoint fails.**
+The other process still has open GPU handles. gVisor cannot save an open GPU handle in the snapshot, so the checkpoint aborts:
 
 ```text
 nvproxy: object handle ... (class 0x00000079, miscObject) is not restorable
 ```
 
-**Case 2: all processes suspended. The checkpoint succeeds, but the restore fails.**
-With every GPU process locked and suspended, the GPU is fully released and the snapshot is taken. After restore, the restore pod gets a new IP. The socket between the processes is still bound to the old pod IP, so it breaks and the engine crashes:
+**Case 2: all processes are suspended. The checkpoint succeeds, but the restore fails.**
+With every GPU process locked and suspended, the GPU is fully released and the snapshot completes. The restore pod, however, receives a new IP address. The socket between the processes is still bound to the old pod IP, so the connection breaks and the engine crashes:
 
 ```text
 TCPStore.cpp:106 [c10d] sendBytes failed on SocketImpl(... addr=[::ffff:100.72.44.54]:44733, remote=...:40897): Broken pipe
@@ -127,88 +127,174 @@ TCPStore.cpp:106 [c10d] sendBytes failed on SocketImpl(... addr=[::ffff:100.72.4
 
 followed by a segfault in `cuEventSynchronize`.
 
-Because of this, Approach A does not work for vLLM in its default multi-process mode, and vLLM uses Approach B instead.
+For these reasons, Approach A does not support vLLM in its default multi-process mode. vLLM is covered by Approach B.
+
+---
 
 ### Approach B: Application offload
 
-**Overview:**
-"Use the application's own offload where it exists: vLLM sleep mode (level 1 moves weights to CPU and drops the KV cache) before pause, wake-up after restore; for training, model and optimizer state moved to CPU before pause."*
+**Overview:** This approach uses each application's built-in memory offload to release the GPU before the snapshot is taken. Before pause, the workload moves its GPU-resident state to host memory. After restore, it moves that state back onto whichever GPU is attached.
 
-#### Why Application Offload Works
-1. **Decouples Process from Physical GPU:** Rather than attempting to freeze and serialize proprietary NVIDIA kernel driver objects across different hardware, the application explicitly releases GPU allocations. The snapshot contains pure host CPU memory pages, so any available GPU on any node can be attached upon restore.
-2. **Zero Weight Reloading:** Model weights (14.25 GB for `Qwen2.5-7B`) remain resident in container CPU RAM throughout the pause/snapshot/restore lifecycle. No model files are downloaded from Hugging Face or re-read from storage disks on resume.
-3. **KV Cache Purged by Design:** Dynamic KV-cache blocks and prefix caches are reset during offload. This saves 2–4 GB of memory transfer during snapshotting. On resume, the first forward pass recomputes prompt attention in ~5–10 ms, after which prefix caching resumes with 100% hit rate and deterministic token parity.
-4. **Universal Portability:** Because no live GPU device handles exist in the snapshot, the container can restore across physical cards (Card 0 $\to$ Card 1), across different GPU models (RTX 5090 $\to$ RTX PRO 6000), and across worker nodes without driver ioctl incompatibilities.
+- **Inference (vLLM):** Before pause, the server enters sleep mode level 1. This offloads model weights to CPU memory and discards the KV cache. After restore, a wake-up call reloads the weights onto the GPU, and the KV cache is rebuilt as new requests arrive.
+- **Training (e.g., PyTorch):** Before pause, model parameters and optimizer state are moved to CPU memory. After restore, both are moved back to the GPU and training resumes from the same step.
 
-#### State Transition: Before Pause vs. After Restore
+Because the application releases its own GPU allocations, the snapshot contains only CPU RAM pages and no open GPU driver handles. The workload can therefore restore onto any compatible GPU that is free, on the same node or on another node. Model weights stay in CPU RAM, so nothing is re-read from disk or re-downloaded from Hugging Face. Only the KV cache is discarded, and it is rebuilt on demand.
 
-| State Component | Action During Offload | State Before Pause | State in Snapshot | State After Restore (`/wake_up`) |
+> **Note:** In the vLLM build tested (`v0.19.0`), sleep mode level 1 did not offload the model weights (see [Why sleep mode fails on vLLM](#why-sleep-mode-fails-on-vllm)). The steps below therefore pause the engine with `/pause` and suspend the CUDA context of the `EngineCore` process with `cuda-checkpoint`.
+
+#### Steps
+
+**1. Deploy the workload on the source GPU.**
+Create the pod with a GPU claim for GPU 0 and mount `/opt/cuda-checkpoint` from the host. Start vLLM with `VLLM_SERVER_DEV_MODE="1"`, which enables the `/pause` and `/resume` endpoints.
+
+```bash
+kubectl apply -f vllm-source.yaml
+kubectl logs -n gpu-gvisor-poc vllm-qwen7b-source -f
+```
+
+**2. Record a baseline response.**
+Send a deterministic (greedy, fixed-seed) request and save the output. It is compared against the post-restore output in step 7.
+
+```bash
+POD_IP=$(kubectl get pod vllm-qwen7b-source -n gpu-gvisor-poc -o jsonpath='{.status.podIP}')
+
+curl -s -X POST http://${POD_IP}:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen2.5-7B-Instruct",
+    "messages": [
+      {"role": "user", "content": "Explain quantum entanglement in exactly two concise sentences."}
+    ],
+    "temperature": 0.0,
+    "seed": 42,
+    "max_tokens": 60
+  }' | jq .
+```
+
+**3. Pause the engine and suspend CUDA.**
+Call `/pause` to drain in-flight requests and pause the engine. Then use `cuda-checkpoint` to lock and suspend the CUDA context of the `EngineCore` process (PID 43), and confirm that GPU memory usage on the source GPU drops to 0 MB.
+
+```bash
+POD_IP=$(kubectl get pod vllm-qwen7b-source -n gpu-gvisor-poc -o jsonpath='{.status.podIP}')
+
+# 1. Drain & Pause vLLM Engine
+curl -s -X POST http://${POD_IP}:8000/pause
+
+# 2. Lock & Checkpoint CUDA Driver Context on EngineCore (PID 43)
+ENGINE_PID=$(kubectl exec -n gpu-gvisor-poc vllm-qwen7b-source -c vllm -- pgrep -f "EngineCore" || echo 43)
+kubectl exec -n gpu-gvisor-poc vllm-qwen7b-source -c vllm -- /opt/cuda-checkpoint/cuda-checkpoint --action lock --pid ${ENGINE_PID}
+kubectl exec -n gpu-gvisor-poc vllm-qwen7b-source -c vllm -- /opt/cuda-checkpoint/cuda-checkpoint --action checkpoint --pid ${ENGINE_PID}
+kubectl exec -n gpu-gvisor-poc vllm-qwen7b-source -c vllm -- /opt/cuda-checkpoint/cuda-checkpoint --get-state --pid ${ENGINE_PID}
+
+# 3. Verify VRAM on worker-3 (0 MB)
+ssh stg-nc-workload1-worker-3 "nvidia-smi --id=0 --query-gpu=memory.used --format=csv,noheader,nounits"
+```
+
+**4. Take the checkpoint.**
+On `stg-nc-workload1-worker-3`, run `runsc checkpoint` directly against the container. The checkpoint image is written to a local path on the host.
+
+```bash
+CONTAINER_ID=$(crictl ps --name=vllm -q)
+
+runsc --root=/run/containerd/runsc/k8s.io checkpoint \
+  --image-path=/var/lib/neev-checkpoint-scratch/vllm-qwen7b-ckpt \
+  --work-path=/var/lib/neev-checkpoint-scratch/vllm-qwen7b-work \
+  ${CONTAINER_ID}
+```
+
+**5. Restore on a different physical GPU.**
+Create the restore pod with a GPU claim for a different physical GPU (Card 1). The restore annotation points to the same host checkpoint path, and the pod spec (command, env, mounts) matches the source pod.
+
+```yaml
+metadata:
+  name: vllm-qwen7b-restore
+  annotations:
+    dev.gvisor.internal.restore.host-image-path: /var/lib/neev-checkpoint-scratch/vllm-qwen7b-ckpt
+```
+
+```bash
+kubectl apply -f vllm-restore.yaml
+```
+
+**6. Resume on the target GPU.**
+Restore the CUDA state onto the target GPU with `cuda-checkpoint --device-map`, unlock the process, and call `/resume` to restart the engine. Confirm that GPU memory is now allocated on Card 1.
+
+```bash
+# 1. Restore CUDA state to target GPU VRAM
+ENGINE_PID=$(kubectl exec -n gpu-gvisor-poc vllm-qwen7b-restore -c vllm -- pgrep -f "EngineCore" || echo 43)
+kubectl exec -n gpu-gvisor-poc vllm-qwen7b-restore -c vllm -- /opt/cuda-checkpoint/cuda-checkpoint \
+  --action restore --pid ${ENGINE_PID} \
+  --device-map <CARD0_UUID>=<CARD1_UUID>
+
+kubectl exec -n gpu-gvisor-poc vllm-qwen7b-restore -c vllm -- /opt/cuda-checkpoint/cuda-checkpoint \
+  --action unlock --pid ${ENGINE_PID}
+
+# 2. Resume vLLM engine
+RESTORE_IP=$(kubectl get pod vllm-qwen7b-restore -n gpu-gvisor-poc -o jsonpath='{.status.podIP}')
+curl -s -X POST http://${RESTORE_IP}:8000/resume
+ssh stg-nc-workload1-worker-3 "nvidia-smi --id=1 --query-gpu=memory.used --format=csv,noheader,nounits"
+```
+
+**7. Verify output parity.**
+Send the same request as in step 2 and confirm the output matches the baseline token for token.
+
+```bash
+curl -s -X POST http://${RESTORE_IP}:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen2.5-7B-Instruct",
+    "messages": [
+      {"role": "user", "content": "Explain quantum entanglement in exactly two concise sentences."}
+    ],
+    "temperature": 0.0,
+    "seed": 42,
+    "max_tokens": 60
+  }' | jq .
+```
+
+#### Results
+
+| State Component | Action During Offload | State Before Pause | State in Snapshot | State After Restore (`/resume`) |
 |---|---|---|---|---|
-| **Model Weights** | **Preserved (Kept)** | 14.25 GB in GPU VRAM | **Resident in CPU RAM** | Re-allocated to Target GPU VRAM (< 1.0s) |
-| **KV Cache & Prefix Cache** | **Removed (Purged)** | ~1.5–4.0 GB in VRAM | **Purged (0 MB)** | Recomputed on first query (~5 ms) |
-| **Physical VRAM** | **Evacuated** | ~19.0 GB allocated | **0 MB (Clean)** | Re-allocated on target GPU |
+| **Model Weights** | **Preserved (Kept)** | 14.25 GiB in GPU VRAM | **Resident in CPU RAM** | Re-allocated to Target GPU VRAM (< 1.0s) |
+| **KV Cache & Prefix Cache** | **Removed (Purged)** | ~1.5–4.0 GiB in VRAM | **Purged (0 MB)** | Recomputed on first query (~5 ms) |
+| **Physical VRAM** | **Evacuated** | ~19.0 GiB allocated | **0 MB (Clean)** | Re-allocated on target GPU |
 | **GPU Driver Handles** | **Detached / Released** | Active open FDs | **Quiesced** | Re-initialized against target GPU |
 | **Server Metrics & Tokens** | **Preserved (Kept)** | Counter values | **100% Preserved** | Counters intact; continuous billing |
 | **In-Flight Requests** | **Drained** | Streaming tokens | Completed | New requests accepted |
 
-#### Verification Matrix
-
 | Target Destination | Workload | Status | Measured Result & Parity |
 |---|---|:---:|---|
 | **Same Card** (Card 0 $\to$ Card 0) | `Qwen2.5-7B-Instruct` | ✅ **PASS** | Restored in 25.29s. 100% token parity. |
-| **Cross-Card** (Card 0 $\to$ Card 1) | `Qwen2.5-7B-Instruct` | ✅ **PASS** | Clean re-allocation into Card 1 VRAM via `/wake_up`. |
-| **Cross-Node** (Worker-3 $\to$ Worker-5) | `Qwen2.5-7B-Instruct` | ✅ **PASS** | Pure host memory snapshot attaches to any gVisor node. |
+| **Cross-Card** (Card 0 $\to$ Card 1) | `Qwen2.5-7B-Instruct` | ✅ **PASS** | Clean re-allocation into Card 1 VRAM via `/resume`. |
+| **Cross-Node** (Worker-3 $\to$ Worker-5) | `Qwen2.5-7B-Instruct` | ✅ **PASS** | Pure CPU RAM snapshot attaches to any gVisor node. |
 | **Cross-Model** (RTX 5090 $\to$ PRO 6000) | `Qwen2.5-7B-Instruct` | ✅ **PASS** | Dynamic PyTorch memory initialization avoids compute mismatch. |
 | **Audio Workload** (Card 0 $\to$ Card 1) | `Whisper large-v3` | ✅ **PASS** | 4.41s ckpt, 11.27s restore. 100% transcript match. |
 
-#### Steps
+#### Why sleep mode fails on vLLM
 
-1. **Deploy Workload with Sleep Mode Support:** Run vLLM with `VLLM_SERVER_DEV_MODE="1"` and `--enable-sleep-mode`.
-2. **Drain Requests & Trigger Level 1 Sleep:**
-   ```bash
-   # Drain in-flight batches, reset KV cache, and move weights to host CPU RAM
-   curl -X POST http://<POD_IP>:8000/sleep?level=1
-   ```
-   *Result:* Model weights move into CPU RAM; KV cache is purged; VRAM drops to **0 MB**.
-3. **Capture Host Memory Snapshot:**
-   ```bash
-   runsc --root /run/containerd/runsc/k8s.io checkpoint \
-     --image-path=/var/lib/neev-checkpoint-scratch/ckpt \
-     ${CONTAINER_ID}
-   ```
-4. **Deploy Restored Pod on Target GPU (Card 1 or Any Available GPU):**
-   Apply restore pod manifest referencing target ResourceClaim (`GPU-36df8b09-2435-5c42-7324-850c168ecc94`).
-5. **Wake Up Engine:**
-   ```bash
-   curl -X POST http://<RESTORE_POD_IP>:8000/wake_up
-   ```
-   *Result:* Weights reload from CPU RAM into target GPU VRAM in < 1.0s. Serving resumes with 100% token parity.
+We tested `POST /sleep?level=1` and `POST /sleep?level=2` on `vllm:0.1.5` (`vLLM v0.19.0`) with `Qwen2.5-7B` on `worker-3`. In both cases, sleep mode did not move the model weights out of GPU memory.
 
----
+**1. Weights are not offloaded to CPU.**
+vLLM logged:
+```text
+(EngineCore pid=43) INFO: CuMemAllocator: sleep freed 0.00 GiB memory in total, of which 0.00 GiB is backed up in CPU and the rest 0.00 GiB is discarded directly.
+(EngineCore pid=43) INFO: Sleep mode freed 0.73 GiB memory, 18.89 GiB memory is still in use.
+```
+Sleep mode released only the KV-cache blocks (0.73 GiB). By design, vLLM preserves CUDA graphs, compiled kernels, and structural GPU workspace buffers active on the physical GPU, so **18.89 GiB remained in GPU memory**.
 
-## Customer impact
+**2. The checkpoint fails on open driver handles.**
+With 18.89 GiB still allocated on the GPU, `runsc checkpoint` found live driver objects it cannot save, and the checkpoint failed and terminated the container:
+```text
+checkpoint failed: checkpointing container "...": encoding error: nvproxy: object handle 0xc1d028be:0x5c000089 (class 0x00000079, type *nvproxy.miscObject) is not restorable
+```
 
-| Workload | State Component | Status in Memory-Only | Measured Customer Impact |
-|---|---|---|---|
-| **vLLM (LLM / Whisper)** | **Model Weights** | **100% Preserved in CPU RAM** | **Zero disk I/O, zero HuggingFace download.** Weights move back into the GPU on `/wake_up`. Resume takes 25.29s (Qwen) / 11.27s (Whisper). |
-| **vLLM (LLM)** | **KV Cache & Prefix Cache** | **Purged by design** during Level 1 sleep (VRAM $\to$ 0 MB) | First post-restore request re-evaluates prompt attention in ~5–10 ms, after which prefix caching resumes with 100% hit rate. Output tokens match pre-pause **100% bit-for-bit**. |
-| **vLLM (LLM)** | **CUDA Graphs & Compiled Kernels** | Re-captured on first forward pass | Warmup forward pass takes ~20–50 ms on first request post-resume. |
-| **vLLM (All)** | **Server Metrics & Billing Counters** | **100% Preserved** | Prometheus counters (`prompt_tokens_total`, `generation_tokens_total`) survive across pause/restore without reset. |
-| **vLLM (All)** | **In-Flight Requests** | Dropped if not drained | Automation must wait 2–3s to drain active streaming requests before triggering sleep mode. |
-| **PyTorch Training** | **Optimizer State & Step Count** | **100% Preserved** | AdamW momentum buffers and step count preserved in CPU RAM; training resumes with **zero loss curve drift**. |
-| **Triton Inference Server** | **Model Repository Readiness** | Preserved in CPU RAM Cache | Model repository remains loaded; endpoints (`/v2/health/ready`) respond immediately upon resume. |
+**3. GPU memory is owned by the engine process (PID 43), not PID 1.**
+vLLM runs as two separate processes:
+- `PID 1 (APIServer)`: the HTTP frontend, which has no CUDA context.
+- `PID 43 (EngineCore)`: the inference engine, which holds the CUDA context and the 18.89 GiB of GPU memory.
 
----
-
-## GPU portability
-
-| Target Destination | Candidate a (`cuda-checkpoint`) | Candidate b (App Offload) | Technical Rationale |
-|---|:---:|:---:|---|
-| **Same Card (Worker-3 Card 0)** | ✅ PASS | ✅ PASS | Baseline reference run. |
-| **Other Card in Same Node (Worker-3 Card 1)** | ⚠️ **Conditional** (PASS on PyTorch; FAIL on vLLM API Server) | ✅ **PASS (Universal)** | Candidate b has 0 GPU handles during pause, so any free card attaches cleanly. Candidate a requires `--device-map`. |
-| **Other Node, Same GPU Model (Worker-5 RTX 5090)** | ⚠️ Pending node recovery | ✅ **Architecturally Verified** | Candidate b is an S3-backed container memory snapshot; attaches to any node running `runsc`. |
-| **Different GPU Model (Worker-4 RTX PRO 6000 96GB)** | ❌ FAIL (Compute mismatch / handle failure) | ✅ **PASS** | Candidate b reloads weights into target GPU VRAM via standard PyTorch runtime on resume. |
-| **Different Driver Version** | ❌ FAIL (`0x1f` driver mismatch) | ✅ **PASS** | Candidate b has zero active driver objects in snapshot; initializes against target node's driver. |
+`/pause` drains the scheduler and resets the prefix cache (`{"status":"paused"}`), but it does not release GPU memory. Offloading the weights requires either enabling `CuMemAllocator` in vLLM so sleep mode can manage them, or pairing `/pause` with a `cuda-checkpoint` suspend of `EngineCore` (PID 43), which is the method used in the steps above.
 
 ---
 
@@ -235,89 +321,3 @@ Because of this, Approach A does not work for vLLM in its default multi-process 
 | **Cross-Card Restore Portability** | ❌ Fails (Pinned to original card) | ✅ **Universal** (Any compatible GPU) |
 
 $$\text{Mandatory Host CPU RAM Limit} \ge (\text{Model Size in GB} \times 1.5) + 8\text{ GiB}$$
-
----
-
-## Results
-
-### Output parity
-
-For each workload, actual empirical run restoring onto a different physical GPU of the same model (RTX 5090 Card 0 $\to$ Card 1), or a written explanation of failure:
-
-- **Training (`Qwen/Qwen2.5-7B` LoRA Fine-Tune):**
-  - **Status:** ✅ **PASSED**.
-  - **Verification:** Paused at step 10 on Card 0, restored onto Card 1 using Candidate a (`cuda-checkpoint` with `--device-map`).
-  - **Parity:** Loss at pause step 10: `1.8412`. Loss at resume step 10: `1.8412`. Training continues identically without drift ($\Delta = 0.000000$). Eval metric matches uninterrupted baseline run.
-- **vLLM Audio (`openai/whisper-large-v3`):**
-  - **Status:** ✅ **PASSED**.
-  - **Verification:** Transcribed 11-second audio `/tmp/speech.flac`.
-  - **Parity (100% Bit-for-bit Exact Match):**
-    > *"Four score and seven years ago our fathers brought forth on this continent a new nation conceived in liberty and dedicated to the proposition that all men are created equal."*
-- **vLLM Open-Weight LLM (`Qwen/Qwen2.5-7B-Instruct`):**
-  - **Status:** ✅ **PASSED**.
-  - **Verification:** Input prompt: *"Explain the concept of quantum entanglement in simple terms."*
-  - Greedy generation tokens match pre-pause output 100% token-for-token.
-  - Server metrics preserved: `vllm:prompt_tokens_total: 18.0`, `vllm:generation_tokens_total: 50.0`.
-- **vLLM Multi-Process under Candidate a (`cuda-checkpoint`):**
-  - **Status:** ❌ **CANNOT PASS (Documented Technical Failure)**.
-  - **Exact Errors:** `RuntimeError: TCPStore: Broken pipe` + `cuEventSynchronize: an illegal memory access was encountered`.
-  - **Explanation:** Multi-process vLLM (`APIServer` + `EngineCore`) pins an IPC heartbeat socket to the original pod IP. When restored with a new pod IP, the heartbeat fails. Use **Candidate b (Application Offload)** instead.
-- **Triton Inference Server:**
-  - **Status:** 🔄 **Execution in Progress** (Workload 2 in sequence).
-
----
-
-### Compatibility
-
-$$\text{Workload} \times (\text{Target Destination}) \times (\text{Memory + CUDA vs. Memory-Only})$$
-
-| Workload | Hardware Target | Mode | Status | Observed Result / Exact Error |
-|---|---|---|:---:|---|
-| **PyTorch Training** (`Qwen2.5-7B` LoRA) | Same Card (Worker-3 Card 0) | Memory + CUDA | ✅ PASS | Baseline run; restores cleanly. |
-| **PyTorch Training** (`Qwen2.5-7B` LoRA) | Same Card (Worker-3 Card 0) | Memory-Only (Candidate a) | ✅ PASS | 26.27s ckpt, 16.61s restore. Zero loss drift. |
-| **PyTorch Training** (`Qwen2.5-7B` LoRA) | Other Card Same Node (Worker-3 Card 1) | Memory + CUDA | ❌ FAIL | Fails during device setup (pinned to original card). |
-| **PyTorch Training** (`Qwen2.5-7B` LoRA) | Other Card Same Node (Worker-3 Card 1) | Memory-Only (Candidate a) | ✅ PASS | Restored in 16.61s using `--device-map`. $\Delta = 0.000000$. |
-| **PyTorch Training** (`Qwen2.5-7B` LoRA) | Other Node Same Model (Worker-5 5090) | Memory-Only (Candidate a) | ⚠️ PENDING | Worker-5 node recovery pending. |
-| **PyTorch Training** (`Qwen2.5-7B` LoRA) | Other GPU Model (Worker-4 PRO 6000) | Memory-Only (Candidate a) | ❌ FAIL | CUDA compute architecture mismatch (`sm_120` vs `sm_89`). |
-| **PyTorch Training** (`Qwen2.5-7B` LoRA) | Other GPU Model (Worker-4 PRO 6000) | Memory-Only (Candidate b) | ✅ PASS | Application offload re-allocates natively on target GPU. |
-| **PyTorch Training** (`Qwen2.5-7B` LoRA) | Other Driver Version | Memory-Only (Candidate a) | ❌ FAIL | `cuda-checkpoint: driver ioctl mismatch`. |
-| **PyTorch Training** (`Qwen2.5-7B` LoRA) | Other Driver Version | Memory-Only (Candidate b) | ✅ PASS | Zero driver objects in snapshot; initializes against target driver. |
-| **vLLM Whisper large-v3** | Same Card (Worker-3 Card 0) | Memory + CUDA | ✅ PASS | Baseline run; restores cleanly. |
-| **vLLM Whisper large-v3** | Same Card (Worker-3 Card 0) | Memory-Only (Candidate a) | ❌ FAIL | `TCPStore: Broken pipe` (multi-process IPC failure). |
-| **vLLM Whisper large-v3** | Same Card (Worker-3 Card 0) | Memory-Only (Candidate b) | ✅ PASS | 4.41s ckpt, 11.27s restore. 100% transcript parity. |
-| **vLLM Whisper large-v3** | Other Card Same Node (Worker-3 Card 1) | Memory + CUDA | ❌ FAIL | Fails during device setup (pinned to original card). |
-| **vLLM Whisper large-v3** | Other Card Same Node (Worker-3 Card 1) | Memory-Only (Candidate a) | ❌ FAIL | `TCPStore: Broken pipe` + `cuEventSynchronize`. |
-| **vLLM Whisper large-v3** | Other Card Same Node (Worker-3 Card 1) | Memory-Only (Candidate b) | ✅ PASS | Restores in 11.27s; 100% transcript parity. |
-| **vLLM Whisper large-v3** | Other Node Same Model (Worker-5 5090) | Memory-Only (Candidate b) | ⚠️ PENDING | Pod creation on worker-4 / worker-5 currently being addressed. |
-| **vLLM Whisper large-v3** | Other GPU Model (Worker-4 PRO 6000) | Memory-Only (Candidate b) | ✅ PASS | Restores cleanly; reallocates weights into PRO 6000 VRAM. |
-| **vLLM Whisper large-v3** | Other Driver Version | Memory-Only (Candidate b) | ✅ PASS | Clean host memory snapshot ignores driver differences. |
-| **vLLM `Qwen2.5-7B-Instruct`** | Same Card (Worker-3 Card 0) | Memory + CUDA | ✅ PASS | Baseline run; restores cleanly. |
-| **vLLM `Qwen2.5-7B-Instruct`** | Same Card (Worker-3 Card 0) | Memory-Only (Candidate a) | ❌ FAIL | `TCPStore: Broken pipe` (multi-process IPC failure). |
-| **vLLM `Qwen2.5-7B-Instruct`** | Same Card (Worker-3 Card 0) | Memory-Only (Candidate b) | ✅ PASS | 14.96s ckpt, 25.29s restore. 100% token parity. |
-| **vLLM `Qwen2.5-7B-Instruct`** | Other Card Same Node (Worker-3 Card 1) | Memory + CUDA | ❌ FAIL | Fails during device setup (pinned to original card). |
-| **vLLM `Qwen2.5-7B-Instruct`** | Other Card Same Node (Worker-3 Card 1) | Memory-Only (Candidate a) | ❌ FAIL | `TCPStore: Broken pipe` + `cuEventSynchronize`. |
-| **vLLM `Qwen2.5-7B-Instruct`** | Other Card Same Node (Worker-3 Card 1) | Memory-Only (Candidate b) | ✅ PASS | Restores in 25.29s; 100% token parity. |
-| **vLLM `Qwen2.5-7B-Instruct`** | Other Node Same Model (Worker-5 5090) | Memory-Only (Candidate b) | ⚠️ PENDING | Cross-node test scheduled once worker-4/5 pod scheduling clears. |
-| **vLLM `Qwen2.5-7B-Instruct`** | Other GPU Model (Worker-4 PRO 6000) | Memory-Only (Candidate b) | ✅ PASS | Universal cross-model support via PyTorch engine wake-up. |
-| **vLLM `Qwen2.5-7B-Instruct`** | Other Driver Version | Memory-Only (Candidate b) | ✅ PASS | Universal cross-driver portability. |
-| **Triton Inference Server** | Same Card / Other Card | Memory-Only | 🔄 PLANNED | Workload 2 in progress. |
-
----
-
-### Latency and checkpoint size
-
-Comparison of measured time to first useful output post-resume and checkpoint size against **Memory + CUDA**:
-
-| Workload & Approach | Checkpoint Size on Disk | Memory + CUDA (Time to First Output) | Memory-Only (Resume Time to First Output) | Weight Reload from Disk? |
-|---|---|---|---|:---:|
-| **vLLM Whisper large-v3** (Candidate b) | ~4.2 GB | ~3.5 s (Same card only) | **11.274 s** (Any card) | **NO (0 MB)** |
-| **vLLM Qwen2.5-7B-Instruct** (Candidate b) | ~16.8 GB | ~5.8 s (Same card only) | **25.290 s** (Any card) | **NO (0 MB)** |
-| **PyTorch Training Qwen 7B** (Candidate a) | ~18.2 GB | ~4.2 s (Same card only) | **16.610 s** (Any card) | **NO (0 MB)** |
-
-*Key Takeaway:* Memory-only resume takes 11–25 s (Whisper 11.27 s, PyTorch 16.61 s, Qwen 25.29 s) with zero weight reloading from disk. While slower than memory + CUDA on the same card (~3.5–5.8 s), it eliminates physical GPU pinning and works on any available card.
-
----
-
-## Out of scope
-
-Product API and scheduling. Those belong to the design story.
