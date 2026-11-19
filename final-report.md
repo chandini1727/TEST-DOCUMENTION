@@ -1,537 +1,445 @@
-# GPU Checkpoint and Restore under gVisor — Proof of Concept Report
+# GPU Pause and Resume Under gVisor: Final PoC Report
 
-## 1. Executive Summary
-
-This Proof of Concept (PoC) evaluates whether the existing `sandbox-sr-operator` snapshot reconciler and `checkpoint-csi-driver` restore mechanism can support checkpoint and restore operations for GPU-based workloads under gVisor using the `runsc-root-self` runtime class.
-
-| What Was Tested | Test Configuration & Scope | Result | Key Finding / Observation |
-|---|---|:---:|---|
-| **PyTorch Training Loop** | In-flight training checkpoint and seamless resume with zero progress loss | **PASS** | Captured in **27.7 s**, restored in **16.6 s**; resumed seamlessly at the next iteration with all model weights and progress intact. |
-| **vLLM Model Serving & KV Cache** | Active model serving and GPU memory across single vs. multi-process modes | **PARTIAL** | Succeeds in single-process mode with 32 GiB RAM (restores in 26 s with <80 ms response). Fails in multi-process setups or when host RAM is less than GPU memory. |
-| **ComfyUI Workspace** | Resuming active ComfyUI without restarting the server or reloading models | **PASS** | Captured in **19.1 s**, restored in **20.1 s**; web UI on port 3000 was immediately accessible (HTTP 200) with zero reload delay. |
-| **Resource Scaling on Restore** | Dynamic CPU/RAM scale-up (4 CPU / 8 GiB) vs scale-down (1 CPU / 100 MiB) | **PARTIAL** | Scale-up succeeded in 22 s; scale-down failed with OOM (`container in state stopped`). |
-| **Template Compatibility** | In-place version upgrade (`0.1.1` to `0.1.2`) vs cross-template restore | **PARTIAL** | Version upgrade resumed computation seamlessly in 18 s; cross-template failed on missing `/opt/venv`. |
-| **Hardware Device Affinity** | Restoring checkpoint onto a different physical GPU card (`Card 1` $\to$ `Card 0`) | **FAIL** | `nvproxy` failed with `NV0000_CTRL_CMD_GPU_GET_ID_INFO status=0x1f`. Device pinning required. |
-| **CUDA Checkpoint Config** | Checkpoint execution without `--cuda-checkpoint-path` flag | **FAIL** | `nvproxy.beforeSave()` rejected capture; utility path is strictly mandatory. |
-| **Multi-GPU Workload Restore** | Dual-GPU allocation, computation, checkpointing, and restore | **FAIL** | Dual-GPU execution and checkpoint succeeded in 10 s, but restore failed during driver initialization (`status=0x1f`). Multi-GPU workloads cannot be resumed. |
-| **GPU Count Mutation** | Restoring 1-GPU checkpoint into a 2-GPU target container spec | **FAIL** | Rejected by gVisor during device remapping; GPU count mutation unsupported. |
-
----
-
-## 2. Background
-
-GPUs are expensive, high-demand resources. When a user runs a GPU workspace (such as ComfyUI, PyTorch, or vLLM) and leaves it inactive, the GPU remains occupied and continues to incur billing costs. If the user deletes the workspace to stop billing, they lose all in-progress work and must set up everything again from scratch.
-
-GPU checkpoint and restore enables **auto-pause and on-demand resume**: when a user is inactive for a given period, the platform can automatically pause the workspace, snapshot its exact memory state, and release the physical GPU back to the pool to prevent idle billing. When the user returns, the platform restores their workload immediately, picking up right where they left off without losing work or needing to restart from scratch.
-
-### Adapting the Snapshot Reconciler for GPU Workloads
-
-Previously, the `sandbox-sr-operator` only ran on CPU worker nodes to pause and resume CPU sandboxes. To enable pause and resume for GPU-based `airuntime` pods, we deployed the operator onto GPU worker nodes and configured GPU checkpointing:
-
-1. **GPU Node Deployment:** Deployed the snapshot reconciler onto GPU nodes with the required GPU tolerations and host volume mounts.
-2. **GPU Workload Detection:** The operator automatically detects if an airuntime pod uses an NVIDIA GPU (`hasGPU = true`) and passes the `--cuda-checkpoint-path` flag to gVisor.
-3. **Runtime & Tooling:** Configured workloads to use `runsc-root-self` (`overlay2 = "root:self"`) with NVIDIA's `cuda-checkpoint` utility mounted to safely freeze and snapshot GPU VRAM state.
-
----
-
-## 3. Test Environment and Checkpoint Workflow
-
-### 3.1 Hardware and Cluster Environment
-
-| Component | Specification |
+| | |
 |---|---|
-| **Environment** | Dev workload cluster |
-| **Worker Node** | `stg-nc-workload1-worker-3` |
-| **GPU Hardware** | NVIDIA GeForce RTX 5090 (32GB) |
-| **RuntimeClass** | `runsc-root-self` (`overlay2 = "root:self"`) |
+| **Tickets** | |
+| **Environment** | Dev |
+| **Runtime** | `runsc-root-self` |
+| **GPUs** | worker-3: 2× RTX 5090 32 GB, driver 595.91.07, CUDA 13.2 · worker-4: RTX PRO 6000 Blackwell 96 GB, driver 615.71.09, CUDA 13.4 |
 
-### 3.2 Checkpoint and Restore Workflow
+This report covers the three stories of the GPU pause and resume work in one document: the memory + CUDA PoC with real workloads, the memory-only restore PoC, and the benchmark. It also includes the trade-off and recommendation that follow from them. Each section follows its ticket requirement by requirement, and every requirement shows either a recorded result or a clear statement that it has not been run yet.
 
-The PoC reuses the platform's standard checkpoint and restore workflow, automatically enabling CUDA checkpoint support whenever a container uses a GPU.
+---
 
-#### Checkpoint Creation
+## Summary
 
-The checkpoint process starts when a `SnapshotJob` is created with the required snapshot configuration, such as `mode: snapshot` and `snapshotType: full`.
+GPU workloads often require expensive hardware resources, and keeping a GPU allocated during periods of inactivity leads to inefficient resource utilization and unnecessary costs. Today an idle AIRuntime either keeps its GPU or is deleted, and deleting it loses the loaded model, the training progress and any warmed-up caches.
 
-The `sandbox-sr-operator` watches the SnapshotJob resource and handles the checkpoint request.
+GPU pause and resume solves this by preserving the workload's execution state while making the GPU available for other workloads during idle periods. Pause reuses the existing sandbox snapshot path: `runsc checkpoint` captures the workload's process memory and root filesystem into a snapshot, the pod and its GPU are released, and resume restores a new pod from that snapshot. Training continues from the step where it paused, and an inference server answers the next request without reloading the model.
 
-The operator follows these steps:
+PR #2409 proved this only on small workloads (GPT-2, a small PyTorch loop, ComfyUI) on one RTX 5090. This report repeats the test on real training jobs and real inference servers running open-weight models (PyTorch LoRA training, Triton Inference Server and vLLM), using two ways of handling the GPU state:
 
-1. **Receive the checkpoint request:** The operator detects the new `SnapshotJob` and starts processing it.
-2. **Identify the target Pod:** The operator identifies the Pod for which the checkpoint must be created.
-3. **Check for GPU usage:** The operator examines the Pod specification for GPU-related resource information, including `spec.resourceClaims` (`resource.k8s.io/v1`) and `nvidia.com/gpu` resource requests.
-4. **Set the GPU flag:** If GPU usage is detected, the operator sets its internal `hasGPU` flag to `true`. Otherwise, it follows the regular non-GPU checkpoint path.
-5. **Prepare the checkpoint command:** When `hasGPU=true`, the operator adds the `--cuda-checkpoint-path` argument to the gVisor checkpoint command. This specifies the location of the CUDA checkpoint utility.
-6. **Execute the checkpoint:** The operator invokes the gVisor checkpoint command for the running container through `nsenter` on the host node.
-7. **Package and upload the checkpoint:** The generated checkpoint files, such as `checkpoint.img`, `pages.img`, and `spec.img`, are packaged into a `.tar.zst` archive, verified using SHA256, and uploaded to object storage (`s3://sandbox-snapshots/`).
-8. **Update the SnapshotJob status:** The operator updates the SnapshotJob with its final status, storage URI, and SHA256 checksum.
+- **Memory and CUDA state checkpoint:** the snapshot keeps the workload's connection to its GPU. The workload resumes exactly as it was, but only on the same physical GPU.
+- **Memory-only checkpoint:** the workload releases the GPU before the snapshot. The workload can then resume on a different GPU.
 
-The checkpoint command for a GPU workload is:
+The report answers four questions:
 
-```bash
-runsc --root /run/containerd/runsc/k8s.io checkpoint \
-  --image-path=/var/lib/neev-checkpoint-scratch/<namespace>/<job>/checkpoint \
-  --exclude-committed-zero-pages \
-  --cuda-checkpoint-path=/opt/cuda-checkpoint/cuda-checkpoint \
-  --leave-running <container_id>
+1. Does pause and resume hold up, with no loss of state, no model reload and identical output?
+2. Can a paused workload be restored on a different GPU, and what does the customer lose when it is?
+3. What does it cost in checkpoint time, frozen time, checkpoint size, restore time and cold start?
+4. Which settings does it force on customers?
+
+---
+
+## How the GPU State Is Preserved
+
+To pause a GPU workload, the platform takes a snapshot of it with gVisor's `runsc checkpoint` and releases the GPU. On resume, a new pod is started from that snapshot and the workload continues from the point at which it was paused. A GPU workload keeps its state in two places: its process memory on the host, and its data in GPU memory, such as model weights, optimizer state and KV cache. Both must be in the snapshot.
+
+In both approaches, NVIDIA's `cuda-checkpoint` tool moves the GPU memory into the process's host (CPU) memory, and gVisor then saves that host memory into the snapshot. Both snapshots therefore hold the same data: the process memory, which now includes the model weights, optimizer state and KV cache. The model is not reloaded from disk after restore in either approach.
+
+The approaches differ in one respect: whether the workload still holds its GPU driver handles when gVisor takes the snapshot.
+
+### Memory and CUDA State Checkpoint (Runtime-Driven)
+
+gVisor runs `cuda-checkpoint` itself, as part of `runsc checkpoint --cuda-checkpoint-path=/opt/cuda-checkpoint/cuda-checkpoint`. The GPU memory is moved into host memory, but the workload keeps its open GPU driver handles, and gVisor saves them in the snapshot together with the memory. On restore, gVisor reopens those handles, the GPU memory is copied back, and the workload continues.
+
+The saved handles refer to the physical GPU on which the snapshot was taken, so the snapshot can be restored only on that same GPU. On any other GPU the restore fails during GPU initialisation with `NV0000_CTRL_CMD_GPU_GET_ID_INFO … status=0x1f`. This is the platform's current GPU checkpoint path: when the operator sees a GPU on the pod, it adds `--cuda-checkpoint-path` to the checkpoint command.
+
+### Memory-Only Checkpoint (In-Container CUDA Suspension)
+
+`cuda-checkpoint` is run inside the container, for every process that holds a CUDA context, before `runsc checkpoint`:
+
+1. `--action lock` blocks new CUDA calls; work already on the GPU finishes.
+2. `--action checkpoint` moves the GPU memory into host memory and closes every GPU driver handle. GPU memory drops to 0 MiB.
+3. A plain `runsc checkpoint`, without `--cuda-checkpoint-path`, saves host memory only, with no GPU handles.
+4. After restore, `--action restore` opens new handles on whichever GPU the new pod has and copies the memory back, and `--action unlock` lets the workload continue.
+
+Because the snapshot holds no GPU handles, it can be restored on a different GPU. In the operator, a `SnapshotJob` with the annotation `sandbox.neevcloud.com/cuda-suspended: "true"` already makes `sandbox-sr-operator` leave out `--cuda-checkpoint-path` and `--leave-running`. Running `cuda-checkpoint` inside the pod through the Kubernetes exec API is not implemented yet; in these tests it was run by hand with `kubectl exec`.
+
+---
+
+## 1. PoC: Memory + CUDA Pause and Resume With Real Workloads
+
+**Purpose:** PR #2409 proved the memory and CUDA state checkpoint only on small workloads on one RTX 5090. This PoC checks, on real training jobs and real inference servers, whether pause and resume holds up, what it costs, and which settings it forces on customers.
+
+### 1.1 Training
+
+**What the ticket asks:** run a real fine-tune of an open-weight model on a public dataset, with mixed precision, gradient accumulation and a dataloader with worker processes. Pause mid-epoch, resume, and train to the end. Compare against an uninterrupted run with the same seed: the loss curve, the final eval loss, the optimizer step count and the LR-scheduler position. The loss curve must continue from the pause step with no restart, and the final eval metric must be within run-to-run noise of the uninterrupted run.
+
+**Setup:**
+
+| Item | Value |
+|---|---|
+| Model | `Qwen/Qwen2.5-7B-Instruct`, HF Transformers + PEFT LoRA (r = 16, alpha = 32, dropout 0.05, `q_proj` and `v_proj`); 4.7 M trainable weights out of 7.6 B |
+| Dataset | `tatsu-lab/alpaca`, shuffled with seed 42; 2,048 training and 256 held-out evaluation examples, 256 tokens each |
+| Training | bf16 mixed precision; gradient accumulation of 4 batches of 2; 2 dataloader workers; AdamW (lr 2e-4); cosine schedule with 5 warm-up steps; 50 steps; seed 42 |
+| Image and memory | `harbor.neev.work/test-template/pytorch-v2.8.0-ubuntu-24.04:0.1.2`, container memory limit 32 GiB |
+
+**How it was tested:**
+
+1. Ran the uninterrupted run (`train-baseline-uninterrupted`) to step 50 and saved the log.
+2. Started `train-pause-source` with the same script and seed, and let it reach step 25. One epoch is 256 steps, so step 25 is mid-epoch.
+3. Suspended CUDA with `cuda-checkpoint` `lock` and `checkpoint` in every Python process (the trainer and the 2 dataloader workers), and confirmed 0 MiB on the GPU.
+4. Ran `runsc checkpoint` on worker-3, deleted the source pod, and created `train-restore-resumed` with the same claim name, command and args, plus the restore annotation.
+5. Ran `restore` and `unlock` in every Python process, followed the log to step 50, and compared it with the uninterrupted run.
+
+The training runs used the memory-only checkpoint (CUDA suspended inside the container) on the same GPU. A training run with the memory and CUDA state checkpoint has not been recorded yet.
+
+**Results:**
+
+| GPU | Cold start | Checkpoint time | Checkpoint size | Restore time | Frozen time | Result |
+|---|---|---|---|---|---|---|
+| RTX 5090 (worker-3), same GPU | 1.95 s model load | 16 s (7 s CUDA suspension + 9 s snapshot) | 22 GB | 8–12 s; first step under 2 s after unlock | ~135 s | Passed |
+| RTX PRO 6000 (worker-4), same GPU | — | 16–19 s | 23 GB | ~10 s | — | Resumed and finished; comparison invalid (see below) |
+
+| Check | Uninterrupted run | Paused and resumed run |
+|---|---|---|
+| Loss / LR at step 25 (pause) | 0.382945 / 1.173648e-04 | 0.382945 / 1.173648e-04 |
+| Loss / LR at step 26 (first step after resume) | 0.733229 / 1.104528e-04 | 0.733229 / 1.104528e-04 |
+| Loss / LR at step 50 | 0.863332 / 0 | 0.863332 / 0 |
+| Optimizer step count | 50 | 50 |
+| Final eval loss | 0.507593 | 0.507593 |
+
+Training continued at step 26 with no restart. Loss and learning rate match at every step to 6 decimal places, so the weights, the AdamW state and the LR-scheduler position all survived, and GPU memory came back to 14,778 MB with no model reload.
+
+**Loss curve, uninterrupted run (steps 1–50; the pause is after step 25):**
+
+```mermaid
+xychart-beta
+    title "Uninterrupted run: training loss, steps 1-50"
+    x-axis "Optimizer step" 1 --> 50
+    y-axis "Training loss" 0 --> 8
+    line [5.0818, 7.1937, 7.0790, 2.3508, 6.3191, 4.7186, 2.8288, 4.9292, 1.4917, 1.0345, 0.7652, 0.7752, 0.9575, 0.4847, 0.5878, 0.9001, 1.0828, 0.4643, 0.6751, 0.3413, 0.3643, 0.7292, 0.4985, 0.7118, 0.3829, 0.7332, 0.4994, 0.3321, 0.4125, 0.5307, 0.8477, 0.3232, 0.7259, 0.5149, 0.7299, 0.8042, 0.8609, 0.5783, 0.3713, 0.4000, 0.3696, 0.4378, 0.2416, 0.7990, 0.5690, 1.0171, 0.7226, 0.5786, 0.5751, 0.8633]
 ```
 
-**Important:** The `--cuda-checkpoint-path` argument is included when the operator identifies the workload as GPU-enabled (`hasGPU=true`). The `--leave-running` option allows the original container to continue running after checkpoint creation. It does not, by itself, guarantee consistency between the checkpointed memory state and data being written to persistent volumes.
+**Loss curve after the pause (steps 25–50): uninterrupted run (line) against the paused and resumed run (bars):**
 
-#### Restore Process
-
-When a user resumes a workload, the platform uses the snapshot ID to retrieve the saved S3 archive and restore the Pod:
-
-1. **Fetch Snapshot Metadata:** The platform queries the snapshot ID to retrieve the S3 archive URI and SHA256 checksum.
-2. **Schedule Pod & Attach GPU:** The restore Pod is scheduled onto the GPU worker node, and NVIDIA DRA assigns the physical GPU device.
-3. **Download Snapshot (CSI Driver):** The `checkpoint.csi.neev.io` driver downloads the snapshot archive from S3 directly to the node and verifies its SHA256 checksum.
-4. **Validate Container Spec:** gVisor confirms that the container's command, arguments, and volume mounts match the saved checkpoint.
-5. **Restore Memory & GPU VRAM:** gVisor re-populates system RAM and GPU VRAM, reconstructing the exact process state, model weights, and execution context.
-6. **Workload Resumes:** The Pod transitions to `Running` in 16 to 26 seconds with zero cold-start delay, picking up execution exactly where it was paused.
-
-**Important:** The container specification (arguments and mounts) must match the checkpoint 1:1, and the Pod must be scheduled onto the same physical GPU card. Any deviation in arguments triggers an `Args does not match` error, and restoring to a different card causes a device ID mismatch.
-
----
-
-## 4. Detailed Test Results
-
-### Test 1: PyTorch Training Loop
-
-**Objective**
-
-To verify that an actively running PyTorch neural network training workload on an NVIDIA GeForce RTX 5090 GPU can be checkpointed mid-training and restored without losing in-flight training progress, model weights, or iteration state.
-
-**Test Execution Steps & Results**
-
-1. **Deploy Training Workload:** A PyTorch neural network workload was deployed on the NVIDIA GeForce RTX 5090 GPU, actively training and continuously optimizing model weights in GPU VRAM.
-2. **Capture Mid-Training Checkpoint:** While training was actively in-flight, a snapshot was triggered using `SnapshotJob`. gVisor and the reconciler captured the complete process memory and GPU VRAM state to S3 in **27.68 seconds**.
-3. **Delete Source Workload:** The running source Pod was deleted (`kubectl delete pod --force`), releasing 100% of the physical RTX 5090 GPU back to the cluster pool (0 MB VRAM occupied).
-4. **Restore Workload:** A restored Pod was deployed from the snapshot archive. The `checkpoint.csi.neev.io` driver downloaded the state from S3, and the workload reached `Running` state in **16.61 seconds**.
-5. **Verify Continuity:** The restored workload automatically resumed training from the exact iteration where it was paused, completed training successfully (`Loss < 0.005`), and output final test predictions with zero progress lost.
-
-**Observed Timing Metrics**
-
-| Operation | Target Hardware | Duration | Status |
-|---|---|:---:|:---:|
-| **Checkpoint (Save)** | NVIDIA GeForce RTX 5090 (32 GiB) | **27.68 seconds** (27,678 ms) | `Ready` |
-| **Restore (Resume)** | NVIDIA GeForce RTX 5090 (32 GiB) | **16.61 seconds** (16,611 ms) | `Running` |
-
-**Technical Analysis**
-
-The checkpoint operation using `runsc-root-self` and `--cuda-checkpoint-path` successfully checkpointed the container's process memory and active GPU VRAM state to S3. Upon restoration, the `checkpoint.csi.neev.io` driver staged the archive, allowing gVisor to re-instantiate the frozen CUDA context on the physical RTX 5090. The restored process resumed execution seamlessly from the exact paused step with all model weights and progress intact.
-
-**Result: PASS**
-
----
-
-### Test 2: vLLM Inference Engine, Model Weights and KV Cache
-
-**Objective**
-
-To verify whether an active vLLM language model serving instance can be checkpointed and restored with its GPU model weights and KV cache memory fully preserved—allowing user inference requests to be served immediately after restoration in under 80 ms without any cold-start model reloading from disk.
-
-**Test Execution Steps & Results**
-
-1. **Deploy Serving Workload:** vLLM was configured in single-process mode (`--distributed-executor-backend uni`) with 32 GiB host RAM, loading GPT-2 and pre-allocating ~28.8 GB of GPU memory on the NVIDIA GeForce RTX 5090 for the attention KV cache.
-2. **Capture Live Checkpoint:** While the HTTP serving endpoints were live and active, a snapshot was triggered via `SnapshotJob`. gVisor and the reconciler checkpointed the entire process memory and GPU VRAM to S3 in **14.0 seconds**.
-3. **Delete Source Workload:** The running vLLM Pod was deleted (`kubectl delete pod --force`), releasing 100% of the physical RTX 5090 GPU back to the platform pool.
-4. **Restore Workload:** A restored Pod was deployed from the snapshot using the `checkpoint.csi.neev.io` driver, reaching `Running` state in **26.0 seconds**.
-5. **Verify Live Inference:** An OpenAI-compatible completions request (`POST http://$POD_IP:8000/v1/completions` with prompt `"NeevCloud AI snapshot test:"` for model `gpt2`) was sent immediately to the restored pod. The endpoint responded with `HTTP/1.1 200 OK` and returned 15 completion tokens without any cold-start model reloading delay from disk.
-
-**Observed Timing Metrics**
-
-| Operation | Target Hardware | Duration | Status |
-|---|---|:---:|:---:|
-| **Checkpoint (Save)** | NVIDIA GeForce RTX 5090 (32 GiB) | **14.0 seconds** | `Ready` |
-| **Restore (Resume)** | NVIDIA GeForce RTX 5090 (32 GiB) | **26.0 seconds** | `Running` |
-| **Inference Query** | `POST :8000/v1/completions` (`gpt2`) | **Instant Response** | `HTTP 200 OK` (15 tokens) |
-
-**Technical Analysis & Failure Breakdown**
-
-The test validated four scenarios to identify the exact conditions required for vLLM checkpointing:
-
-1. **What Failed — Scenario 1 (Default Multi-Process Architecture):**
-   - **Configuration:** Default vLLM execution model running separate processes for the API server (PID 1) and GPU engine (PID 30) communicating via CUDA Inter-Process Communication (CUDA IPC).
-   - **Observed Error:**
-     ```text
-     checkpoint failed: "cuda-checkpoint --toggle for PID 30" failed with exit status 256; output: "Error toggling CUDA in process ID 30: OS call failed or operation not supported on this OS"
-     ```
-   - **Root Cause (Shared GPU Memory via CUDA IPC):** In default vLLM, the API server (`PID 1`) and GPU engine (`PID 30`) share GPU memory allocations using CUDA IPC shared handles. When `cuda-checkpoint --toggle` attempts to freeze the GPU context for PID 30, the NVIDIA driver rejects the operation because active GPU memory is mapped across process boundaries. gVisor cannot coordinate the simultaneous freezing of multi-process shared memory, causing the underlying OS call to fail (`status 256`). Eliminating cross-process shared memory by running in single-process mode (`--distributed-executor-backend uni`) resolves this issue completely.
-
-2. **What Failed — Scenario 2 (Container RAM Too Small for GPU State):**
-   - **Setup:** The GPU has 32 GB VRAM and vLLM was actively using 28.8 GB of it, but the container's CPU RAM was limited to only 16 GiB.
-   - **Observed Error:**
-     ```text
-     urpc method "containerManager.Checkpoint" failed: EOF
-     ```
-   - **Root Cause (Out-Of-Memory during GPU Data Transfer):** To save a checkpoint, `cuda-checkpoint` must pull the active 28.8 GB of GPU memory into the container's CPU RAM before writing it out to disk/S3. Because the container only had 16 GiB of RAM, trying to pull 28.8 GB of GPU data immediately exhausted the container's memory, causing an Out-Of-Memory (OOM) crash (`EOF`). To snapshot successfully, container RAM must be sized larger than the GPU memory in use ($\ge 32\text{ GiB}$).
-
-3. **What Passed — Scenarios 3 & 4 (Single-Process with Adequate Host RAM):**
-   - **Configuration:** Single-process mode (`VLLM_ENABLE_V1_MULTIPROCESSING=0`, `--distributed-executor-backend uni`) with container memory limit increased to 32 GiB ($\text{Host RAM} \ge 1.25\times \text{Allocated VRAM}$).
-   - **Observed Results:** Checkpoint completed in **14.0 seconds**, released physical GPU VRAM to 0 MB upon pod deletion, restored in **26.0 seconds**, and served live OpenAI inference queries (`POST :8000/v1/completions`) in <80 ms with full model weights and attention KV cache intact.
-
-**Result: PARTIAL**
-
-The default multi-process vLLM configuration fails during checkpointing due to CUDA IPC limitations, and undersized host RAM causes OOM crashes during VRAM staging. However, vLLM configured in single-process mode with $\ge 32\text{ GiB}$ host RAM passes reliably, restoring in 26.0 s and serving live inference queries in <80 ms with active KV cache intact.
-
----
-
-### Test 3: ComfyUI Workspace Pause and Resume
-
-**Objective**
-
-To verify whether an active ComfyUI generative AI workspace running on an NVIDIA GeForce RTX 5090 GPU can be paused (checkpointed) and resumed on demand, keeping its web UI on port 3000 immediately responsive without server restarts, dropped connections, or model reload delays.
-
-**Test Execution Steps & Results**
-
-1. **Deploy Workspace Workload:** Deployed the ComfyUI workspace Pod on the NVIDIA GeForce RTX 5090 using container image `harbor.neev.work/gpu/comfyui:0.1.5`, initializing the web server on port 3000.
-2. **Verify Pre-Snapshot Availability:** Queried the endpoint via curl, confirming `HTTP Response: 200` with the web UI fully accessible.
-3. **Capture Live Checkpoint:** A snapshot was triggered via `SnapshotJob`. gVisor and the snapshot reconciler checkpointed the complete process memory and active GPU VRAM to S3 in **19.07 seconds** (19,075 ms).
-4. **Delete Original Pod & Release GPU:** Deleted the running source Pod (`kubectl delete pod --force --grace-period=0`), releasing 100% of the physical RTX 5090 GPU resources back to the platform pool.
-5. **Restore Workload via CSI:** A restored Pod was deployed from the S3 snapshot using the `checkpoint.csi.neev.io` driver, reaching `Running` state in **20.08 seconds** (20,081 ms).
-6. **Verify Service After Restore:** Queried the restored pod endpoint via curl, receiving `HTTP Response: 200` immediately with zero model reload delay or server re-initialization.
-
-**Observed Timing Metrics**
-
-| Operation | Target Hardware | Duration | Status |
-|---|---|:---:|:---:|
-| **Checkpoint (Save)** | NVIDIA GeForce RTX 5090 (32 GiB) | **19.07 seconds** (19,075 ms) | `Ready` |
-| **Restore (Resume)** | NVIDIA GeForce RTX 5090 (32 GiB) | **20.08 seconds** (20,081 ms) | `Running` |
-| **Web UI Port 3000** | HTTP GET `/` verification | **Instant** | `HTTP 200 OK` |
-
-**Technical Analysis**
-
-The Python web server listening on port 3000 resumed serving incoming HTTP requests immediately upon container restoration with zero cold-start delay or dropped connections.
-
-**Result: PASS**
-
----
-
-### Test 4: CPU and Memory Scaling During Restore
-
-**Objective**
-
-To check whether a GPU workload can be restored when the CPU and memory resources assigned to the target Pod differ from those assigned to the original Pod.
-
-**Test Execution and Results**
-
-1. An initial snapshot was taken from the running GPU workload (configured with 2 CPU, 4 Gi RAM, and 1 GPU). The operator captured the container and GPU VRAM state using `runsc checkpoint` with `--cuda-checkpoint-path`, producing a 644 MiB snapshot uploaded to S3. The original Pod was then deleted.
-2. We restored the snapshot by increasing its resources to 4 CPU and 8 Gi RAM. The workload restored successfully in 22 seconds, and the model was immediately responsive.
-3. We restored the snapshot by decreasing its resources to 1 CPU and 100 Mi RAM. The restore failed with `StartError` because the assigned 100 MiB memory limit was smaller than the 644 MiB snapshot size.
-
-**Observed Logs:**
-
-```text
-Events:
-  Type     Reason    Age   From     Message
-  ----     ------    ----  ----     -------
-  Warning  Failed    9s    kubelet  spec.containers{cuda}: Error: failed to start containerd task "cuda": OCI runtime restore failed: starting container: cannot restore container "cuda" in state stopped
+```mermaid
+xychart-beta
+    title "Steps 25-50: uninterrupted (line) vs paused and resumed (bars)"
+    x-axis "Optimizer step" 25 --> 50
+    y-axis "Training loss" 0 --> 1.2
+    bar [0.3829, 0.7332, 0.4994, 0.3321, 0.4125, 0.5307, 0.8477, 0.3232, 0.7259, 0.5149, 0.7299, 0.8042, 0.8609, 0.5783, 0.3713, 0.4000, 0.3696, 0.4378, 0.2416, 0.7990, 0.5690, 1.0171, 0.7226, 0.5786, 0.5751, 0.8633]
+    line [0.3829, 0.7332, 0.4994, 0.3321, 0.4125, 0.5307, 0.8477, 0.3232, 0.7259, 0.5149, 0.7299, 0.8042, 0.8609, 0.5783, 0.3713, 0.4000, 0.3696, 0.4378, 0.2416, 0.7990, 0.5690, 1.0171, 0.7226, 0.5786, 0.5751, 0.8633]
 ```
 
-**Technical Analysis**
+The line passes through the top of every bar: after the resume, the paused and resumed run follows the uninterrupted curve exactly. Both charts are drawn from the step logs in `APPROACH_A_PYTORCH_TRAINING.md`; the paused run's log is available from step 25.
 
-The scale-up scenario completed successfully in 22 seconds. The scale-down scenario failed during container restoration with `cannot restore container "cuda" in state stopped`.
+**Worker-4:** the paused run finished all 50 steps with a final eval loss of 0.507348. The recorded uninterrupted worker-4 run has a different loss curve (step 1 loss 24.7 instead of 5.08, final eval loss 0.498626), so it did not use the same script, and the comparison must be rerun before it counts.
 
-The snapshot size was approximately 644 MiB, while the target Pod was assigned only 100 MiB of memory limit. Attempting to restore a 644 MiB memory snapshot into a 100 MiB container triggered an immediate Out-of-Memory (OOM) abort during state reconstruction.
+### 1.2 Triton Inference Server
 
-**Result: PARTIAL**
+**What the ticket asks:** serve at least one model through Triton, and a vLLM-backend LLM if possible. Pause while it is loaded and warmed up, then resume. Check the model repository state, model readiness and the HTTP/gRPC endpoints, and check that output after resume matches output before the pause for fixed inputs. Record whether Triton's Python backend stubs checkpoint at all.
 
-The tested scale-up configuration restored successfully. The tested scale-down configuration of 1 CPU and 100 MiB failed.
+**Setup:**
 
----
+| Model | Backend and image | Processes | GPU memory |
+|---|---|---|---|
+| `text_embedding` | PyTorch (LibTorch), `nvcr.io/nvidia/tritonserver:24.08-py3` | `tritonserver` only | 873 MiB |
+| `Qwen2.5-7B-Instruct` | vLLM backend, `harbor.neev.work/test-template/triton-server-vllm:0.2.0`; `gpu_memory_utilization 0.6`, `max_model_len 4096`, `enforce_eager` | `tritonserver` (PID 1), Python backend stub (PID 500), `VLLM::EngineCore` (PID 713) | 22,829 MiB (15.2 GB weights + 7.6 GB KV cache) |
 
-### Test 5: Template Version Upgrade
+Triton opens a CUDA context on every GPU it can see, so it used 571 MiB on the second RTX 5090 with no model there. Set `CUDA_VISIBLE_DEVICES=0` to keep it on one GPU.
 
-**Objective**
+**How it was tested:**
 
-To verify whether an active GPU workload checkpointed on an older template image can be seamlessly resumed on an upgraded patch version of the same template.
+1. Loaded and warmed up the model, sent a fixed input, and saved the output.
+2. Paused the server: either a memory and CUDA state checkpoint, or CUDA suspended in every process followed by a memory-only checkpoint.
+3. Restored the pod with the same claim name, command and args.
+4. Checked `/v2/repository/index`, server and model readiness, the HTTP endpoints and gRPC port 8001, then sent the same input and compared the output.
 
-**Test Execution and Results**
+**Results on worker-3 (RTX 5090):**
 
-1. A PyTorch workload was actively executing computation on an initial template version (`pytorch-v2.8.0-ubuntu-24.04:0.1.1`).
-2. An in-place snapshot was taken to capture its exact running memory state, after which the original Pod was deleted to release the GPU.
-3. The workload was restored onto an upgraded patch release of the template (`pytorch-v2.8.0-ubuntu-24.04:0.1.2`).
-4. The workload restored successfully in approximately 18 seconds, immediately continuing its in-flight computation on the upgraded image without restarting from scratch.
+| Model | Approach | Cold start | Checkpoint time | Checkpoint size | Restore time | Result |
+|---|---|---|---|---|---|---|
+| `text_embedding` | Memory and CUDA state | — | — | — | — | Passed: readiness HTTP 200, identical output |
+| `text_embedding` | Memory-only | — | — | — | 6 s | Passed: model `READY`, HTTP 200, gRPC 8001 open, identical output (max difference 0.0, cosine 1.0); 5 cycles; second-generation restore in 7 s |
+| Qwen2.5-7B, vLLM backend | Memory and CUDA state | 141 s (89 s cached) | 18 s | 19 GB | 9 s | Passed: identical text, `nv_inference_count` 2 → 3 |
+| Qwen2.5-7B, vLLM backend | Memory-only | 141 s (89 s cached) | — | 28 GB | — | Passed: model `READY`, GPU memory back to 22,829 MiB, identical text |
 
-**Observed Logs:**
+"—" means not recorded.
 
-```text
-=== Restoring Workload from Snapshot on Template v0.1.2 ===
-[PyTorch v0.1.2 Restore] Resuming from checkpoint...
-[CARD-1] tick=35 sample=35.0 VRAM=256.0MB
-[CARD-1] tick=36 sample=36.0 VRAM=256.0MB
-```
+- **No weight reload:** all three vLLM-backend processes kept their original uptime (about 30 min) after restore.
+- **In-flight requests:** while CUDA is locked, a request waits and Triton keeps the HTTP connection open; after unlock it completes with HTTP 200.
+- **Python backend stubs:** they checkpoint with both approaches. For a memory-only checkpoint, CUDA must be suspended in the stub as well.
+- **Embedding model, 5 cycles:** 873 MiB of GPU memory and 2,127 MB of host memory after every resume, with identical output every time.
+- **Not done yet:** a real gRPC inference request (only the port was checked), 5 cycles for the vLLM backend, and worker-4.
 
-**Technical Analysis**
+### 1.3 vLLM
 
-The restored process reloaded its memory and GPU execution context cleanly on the upgraded template image (`v0.1.2`) and continued processing without state regression or initialization delay.
+**What the ticket asks:** run Whisper large-v3 (transcribe a fixed audio set before and after the pause; transcripts must match), a ~8B LLM and a ~14–32B LLM that fits on one GPU. Try both the default multi-process mode and single-process mode, confirm whether a newer runsc and `cuda-checkpoint` fix the failure seen in PR #2409, and measure what single-process mode costs if it is required. Check that a seeded greedy request returns the same tokens, prefix-cache hits continue, the weights are not reloaded, and record what happens to in-flight requests.
 
-Because minor patch versions maintain consistent library paths and filesystem structures, the runtime validated and reconstructed the container seamlessly. As demonstrated in Test 2, changes that modify core filesystem paths (such as the Python virtual environment or CUDA toolchains) must maintain layout compatibility for restore to succeed.
+**Setup:** image `harbor.neev.work/test-template/vllm:0.1.5`, default multi-process mode: the API server (PID 1) and `VLLM::EngineCore` run as separate processes, and only the engine holds a CUDA context. The runs used `--enforce-eager`.
 
-**Result: PASS**
+**How it was tested:**
 
----
+1. Started vLLM with the model, waited for it to load, and recorded the cold start.
+2. Sent the fixed input (a seeded greedy prompt with `temperature 0` and `seed 42`, or the audio set) and saved the output and the prefix-cache counters from `/metrics`.
+3. Took the checkpoint, restored the pod with the same claim name, and sent the same input again.
+4. Compared the output and the prefix-cache counters, and checked the log for model loading.
 
-### Test 6: Cross-Template Restore
+**Results:**
 
-**Objective**
+| Model | GPU | Approach | Cold start | Checkpoint time | Checkpoint size | Restore time | Result |
+|---|---|---|---|---|---|---|---|
+| Whisper large-v3 | RTX 5090 | Memory and CUDA state | 98 s | — | — | — | In progress |
+| Whisper large-v3 | RTX 5090, Card 0 → Card 1 | Memory-only | 98 s | 4.41 s | — | 11.27 s | Reported passed with matching transcripts; log not attached |
+| Qwen2.5-7B, util 0.90 (29,525 MiB), limit 48 GiB | RTX 5090 | Memory and CUDA state | — | 28 s | 18 GB | 5 s | Passed |
+| Qwen2.5-14B-AWQ, util 0.90 (86.4 GB) | RTX PRO 6000 | Memory and CUDA state | 236 s | Failed | — | — | 64 GiB limit: `containerManager.Checkpoint failed: EOF`; 128 GiB: `OOMKilled` (node RAM 91.1 GiB) |
+| Qwen2.5-14B-AWQ, util 0.38 (~36.5 GB) | RTX PRO 6000 | Memory and CUDA state | — | — | — | — | In progress |
 
-To check whether a checkpoint created using one container template can be restored using a different container template.
+"—" means not recorded.
 
-**Test Execution and Results**
+**State checks for Qwen2.5-7B:**
 
-1. An active PyTorch GPU workload was snapshotted.
-2. A restore Pod was deployed using the saved checkpoint but specifying a different base Ubuntu image (`ubuntu-24.04:0.1.3`).
-3. The target image did not contain the `/opt/venv` directory present in the source container.
-4. The restore Pod entered `StartError` during container creation.
+- **Same tokens:** the seeded greedy prompt returned identical tokens.
+- **Prefix-cache hits continue:** the counters continued from 205 queries and 128 hits instead of resetting to 0.
+- **Weights not reloaded:** both processes were still running after restore, with no model loading in the log.
+- **In-flight requests:** not recorded yet.
 
-**Observed Logs:**
+**Multi-process vs. single-process mode:** PR #2409 saw the CUDA toggle fail on the engine process in multi-process mode (`cuda-checkpoint --toggle for PID 30 failed with exit status 256`). With `runsc-20260905` and the current `cuda-checkpoint`, multi-process mode passes, so single-process mode is not required and its throughput cost was not measured. The earlier failure came from a 16 GiB memory limit and a wrong checkpoint command: `--cuda-checkpoint-path` must point to the `cuda-checkpoint` binary, and the full 64-character container ID must be passed.
 
-```text
-Events:
-  Type     Reason    Age   From     Message
-  ----     ------    ----  ----     -------
-  Warning  Failed    8s    kubelet  spec.containers{cuda}: Error: failed to start containerd task "cuda": OCI runtime restore failed: starting container: starting sub-container: failed to load kernel: vfs.CompleteRestore() failed: failed to complete restore for filesystem type "9p": failed to walk "opt/venv" of type 040000 in mount "cuda:/": no such file or directory
-```
+**Earlier reference, GPT-2 (PR #2409), about 28.8 GB of GPU memory:** multi-process with 16 GiB failed with the toggle error; single-process with 16 GiB failed with `EOF`; single-process with 32 GiB passed, with a 14 s checkpoint, a 6.0 s restore against a 45 s cold start, identical output and no reload.
 
-**Technical Analysis**
+**Limit found:** processes that share GPU memory through CUDA IPC (`cudaIpcOpenMemHandle`) cannot be checkpointed. The checkpoint hung for 207 s and failed with `exit status 9`. Standard vLLM does not do this, because only the engine uses CUDA.
 
-During restoration, gVisor validates and reconstructs the saved container filesystem state. The checkpoint referenced the `/opt/venv` directory, but the target container image did not contain that directory.
+### 1.4 Across All Workloads
 
-The filesystem restoration process therefore failed in `vfs.CompleteRestore()` with `no such file or directory`.
+**GPUs (RTX 5090 and RTX PRO 6000 at minimum):** all workloads ran on the RTX 5090. On the RTX PRO 6000 only training (comparison invalid, see 1.1) and the 14B model (failed on host memory) have run.
 
-This test demonstrates that the tested source and target images were not filesystem-compatible for restore.
+**Host-memory sizing:** GPU memory is copied into the container's memory during the checkpoint, so the container memory limit must hold the GPU memory in use plus the process's own memory.
 
-**Result: FAIL**
+| GPU | Workload | GPU memory in use | Memory limit | Result |
+|---|---|---|---|---|
+| RTX 5090 | vLLM GPT-2 (PR #2409) | 28.8 GB | 16 GiB | Failed, `EOF` |
+| RTX 5090 | vLLM GPT-2 (PR #2409) | 28.8 GB | 32 GiB | Passed |
+| RTX 5090 | Qwen2.5-7B LoRA training | 14.4 GB | 32 GiB | Passed |
+| RTX 5090 | vLLM Qwen2.5-7B | 29.5 GB | 24 GiB | Failed, `OOMKilled` |
+| RTX 5090 | vLLM Qwen2.5-7B | 29.5 GB | 48 GiB | Passed |
+| RTX PRO 6000 | vLLM Qwen2.5-14B-AWQ | 86.4 GB | 64 GiB | Failed, `EOF` |
+| RTX PRO 6000 | vLLM Qwen2.5-14B-AWQ | 86.4 GB | 128 GiB | Failed, node out of RAM (91.1 GiB) |
 
----
+**Rule:** set the container memory limit to at least **1.2× the GPU memory in use**, and make sure the node has that much free RAM. On worker-4 the GPU (96 GB) is larger than the node's RAM (91.1 GiB), so a workload that uses most of the GPU cannot be paused there. The RTX 5090 has 5 data points; the RTX PRO 6000 still needs passing runs to reach the 3 data points the ticket asks for.
 
-### Test 7: Ceph PVC Consistency During Checkpoint
+**Repeat cycles (at least 5 per workload):** only the Triton embedding model has completed 5 pause and resume cycles, with identical output and no growth in GPU or host memory. Every other workload has completed 1 cycle.
 
-**Objective**
+**Measurements per run:** checkpoint time, frozen time, checkpoint size, restore time and cold start are given per workload above and collected in Section 3.
 
-To check whether data written to a Ceph persistent storage volume remains consistent when a checkpoint is taken while the workload is actively running and writing to disk.
+### 1.5 Acceptance Criteria (Memory + CUDA PoC)
 
-**Test Execution and Results**
+- **Results table per workload × GPU with pass/fail, numbers and errors:** Sections 1.1–1.4 and the table in Section 3. Worker-3 is done for training, Triton and vLLM Qwen2.5-7B. Worker-4 is partial: the training comparison is invalid and the 14B runs failed. Whisper is not finished.
+- **Every result from an actual run, with logs and manifests attached:** manifests and logs are in the source documents; the raw training logs and the Whisper memory-only log still have to be attached.
+- **Training loss curve plotted against the uninterrupted run, and final eval metric compared:** done for worker-3 (Section 1.1), with identical final eval loss.
+- **Triton and vLLM output matches for fixed inputs, and no weight reload:** done for Triton (both models) and vLLM Qwen2.5-7B. Not done for Whisper and the ~14–32B model.
+- **Host-memory rule with at least 3 data points per GPU:** stated in Section 1.4, with 5 data points on the RTX 5090; the RTX PRO 6000 has only failures so far.
 
-1. A GPU workload ran with a Ceph persistent storage volume attached, continuously writing log entries to `/workspace/workload.log`.
-2. A gVisor checkpoint only captures memory and GPU state, while the Ceph storage volume must be cloned separately in Kubernetes. We tested two approaches:
-3. **Attempt 1 — Snapshot while Pod was running (without pausing):**
-   - The memory snapshot was captured first while the workload was at `tick=23`.
-   - Next, Kubernetes started cloning the Ceph storage volume, which took 14 seconds to complete.
-   - Because the Pod was never paused, it kept running in the background during those 14 seconds and wrote up to `tick=46`. By the time the volume clone finished, the disk had captured data up to `tick=46`.
-   - When restored, the workload's memory rolled back to `tick=23`, but the cloned disk was already at `tick=46`, causing memory and disk to get completely out of sync.
-
-**Observed Logs:**
-
-```text
-[2026-11-10T14:22:14Z] tick=45 val=45.0
-[2026-11-10T14:22:15Z] tick=46 val=46.0   <-- Written to disk while the volume clone was finishing
-[2026-11-10T14:22:29Z] tick=23 val=23.0   <-- Workload memory resumed here on restore
-[2026-11-10T14:22:30Z] tick=24 val=24.0
-```
-
-4. **Attempt 2 — Snapshot after pausing the Pod (Zero Drift):**
-   - **Pause Pod:** We first paused the container using `runsc pause`. This immediately stopped execution and froze all active writes to disk.
-   - **Capture Memory:** We took the memory and GPU checkpoint while the workload was frozen.
-   - **Clone Volume:** We cloned the Ceph storage volume while disk writes remained stopped.
-   - **Resume / Release:** Once the volume clone completed, the container could either be resumed (`runsc resume`) or terminated to release the GPU.
-   - On restore, both memory and disk were aligned at the exact same point, restoring cleanly with zero storage drift.
-
-**Technical Analysis**
-
-When a workload is actively writing to persistent disk storage, taking a memory snapshot without pausing the container causes storage drift: the container keeps writing to disk while the storage volume is being cloned.
-
-Pausing the Pod first (`runsc pause`) stops all active writes immediately. Taking the memory checkpoint and cloning the volume while the container is paused ensures that disk data and in-memory execution state remain 100% consistent.
-
-**Result: PARTIAL**
+**Out of scope for this PoC:** multi-GPU (tensor parallel, DDP). Cross-card and memory-only restore are covered in Section 2.
 
 ---
 
-### Test 8: Hardware Device Affinity — Cross-Card Restore
+## 2. PoC: Memory-Only Restore Onto a Different GPU
 
-**Objective**
+**Purpose:** a memory and CUDA state snapshot can be restored only on the same physical GPU. PR #2409 showed that restoring onto another RTX 5090 in the same node fails during GPU device setup, and this was confirmed with Triton (`status=0x1f`). If resume needs that exact card, a paused workload cannot come back once someone else is using the card. This PoC tests whether a memory-only restore can bring the workload back on whichever compatible GPU is free.
 
-To determine whether a GPU snapshot can be restored onto any available GPU of the same model, or if it is strictly bound to the specific physical card that created the snapshot.
+**Workloads:** the same as Section 1. Training (Qwen2.5-7B LoRA), Triton (embedding model and the vLLM backend) and vLLM (Whisper large-v3 and Qwen2.5-7B).
 
-**Test Execution and Results**
+### 2.1 Can Memory-Only Work From the Same Checkpoint?
 
-1. A PyTorch GPU workload was allocated physical GPU Card 1 using Kubernetes Dynamic Resource Allocation (DRA).
-2. The running workload was snapshotted, capturing its active GPU VRAM and process state in 14 seconds.
-3. The original Pod and its resource claim were deleted to completely release Card 1 back to the cluster pool.
-4. A restore Pod was then scheduled onto Card 0—an identical physical GPU on the same host, but located at a different PCI bus address with a different device UUID.
-5. During container initialization, the restore operation failed immediately with `StartError`.
+**Candidate (a): restore with CUDA left suspended, attach the new GPU, then resume CUDA on the new device.** This works, provided CUDA is suspended inside the container before the checkpoint is taken (the memory-only checkpoint described above). A snapshot taken with `--cuda-checkpoint-path` cannot be used for this, because it still holds the GPU driver handles, and gVisor tries to reopen them on the original GPU before CUDA can be moved, which fails with `status=0x1f`.
 
-**Observed Logs:**
+The tested steps were:
 
-```text
-Events:
-  Type     Reason    Age   From     Message
-  ----     ------    ----  ----     -------
-  Warning  Failed    12s   kubelet  spec.containers{cuda}: Error: failed to start containerd task "cuda": OCI runtime restore failed: starting container: starting sub-container: failed to get nvproxy device IDs: NV0000_CTRL_CMD_GPU_GET_ID_INFO for minor=0 gpuId=0x100 failed: status=0x1f
-```
+1. Deploy the workload on the source GPU, with a claim for that GPU and `/opt/cuda-checkpoint` mounted from the host.
+2. Confirm that the model is loaded and the workload is running.
+3. Run `lock` and then `checkpoint` in every CUDA process, and check that `--get-state` reports `checkpointed` and the GPU shows 0 MiB.
+4. Run `runsc checkpoint` on the node, without `--cuda-checkpoint-path`.
+5. Delete the source pod and create the restore pod with the same claim name. The claim's selector points to the target GPU UUID; the command, args and restore annotation stay the same.
+6. Run `restore` and then `unlock` in each process.
+7. Verify the output, or check that the training loss continues.
 
-**Technical Analysis**
+**Candidate (b): the application's own offload.**
 
-During restore, gVisor's `nvproxy` layer reconnects with the NVIDIA kernel driver using the control command `NV0000_CTRL_CMD_GPU_GET_ID_INFO`.
+- **vLLM sleep mode does not work in the tested build** (`vllm:0.1.5`, vLLM 0.19.0). With `POST /sleep?level=1` and `level=2`, vLLM logged `Sleep mode freed 0.73 GiB memory, 18.89 GiB memory is still in use`. It dropped only the KV cache and kept the weights on the GPU, and the checkpoint then failed with `nvproxy: … miscObject is not restorable`.
+- **vLLM `/pause`:** the GPU memory belongs to `EngineCore` (PID 43), not to the API server (PID 1). `/pause` drains requests and resets the prefix cache, but it does not free GPU memory. It was therefore combined with candidate (a): `VLLM_SERVER_DEV_MODE=1` enables `/pause` and `/resume`; `/pause` is called, CUDA is suspended in all processes, the container is checkpointed and restored, CUDA is restored and unlocked, and `/resume` is called.
+- **Training:** moving the model and optimizer to CPU before the pause was not tested, because candidate (a) already works without any change to the training code.
 
-When capturing the snapshot, CUDA saves the exact physical GPU hardware identity (including the motherboard PCI slot and device UUID) directly into the snapshot file. When restoring onto Card 0, the NVIDIA driver detected that the saved hardware identity did not match Card 0 and rejected the restore (`status=0x1f`), even though both cards are identical RTX 5090 models.
+**Candidate (c): other options found during the investigation.**
 
-This shows that GPU snapshots are not portable across different physical cards. A paused workload cannot be restored onto another card; the platform scheduler must pin and restore the workload back to the original physical GPU device.
+- **Device remapping:** `cuda-checkpoint --action restore` binds to the GPU attached to the restored pod without any mapping. `--device-map <oldUuid>=<newUuid>` is optional, but if it is used it must list every GPU the process opened, or it fails with `invalid argument`.
+- **Newer runsc:** the runs used `runsc-20260905`. It fixed the multi-process failure from PR #2409, but it does not remove the same-GPU limit of the memory and CUDA state checkpoint.
 
-**Result: FAIL**
+### 2.2 Results Per Workload
 
-Restoring a GPU snapshot onto a different physical GPU card of the same model failed. GPU checkpoint restore requires strict 1:1 hardware device affinity.
+| Workload | Result on another GPU in the same node (worker-3, Card 0 → Card 1) |
+|---|---|
+| Training, Qwen2.5-7B LoRA | Passed. Restore in 12 s. Training continued to step 50 with a final eval loss of 0.507593, the same as the uninterrupted run, and 14,778 MB of GPU memory on the new card. |
+| Triton, embedding model | Passed. Restore pod running in 6 s, identical output, 5 cycles with no memory growth. |
+| Triton, vLLM backend | Checkpoint and restore passed with identical output. The claim selected Card 1, but `nvidia-smi` showed the memory on index 0, so the card change still has to be confirmed by UUID. |
+| vLLM, Whisper large-v3 | Reported as passed with matching transcripts (checkpoint 4.41 s, restore 11.27 s); the run log is not attached. |
+| vLLM, Qwen2.5-7B | First attempt failed: the API server still held GPU handles (`miscObject … not restorable`), and once those were suspended too, the engine's internal socket broke on the new pod IP (`Broken pipe`). Second attempt with `/pause` first: the checkpoint passed (8 s, 18 GB) and was copied to worker-4 in 173 s, but the restore has not been completed. |
 
----
+**Why the Triton vLLM backend survives a new pod IP and standalone vLLM does not:** standalone vLLM connects the engine and the API server through a PyTorch `TCPStore` bound to the pod IP, and a restored pod gets a new IP. Triton connects to the stub and the engine through shared memory (`/dev/shm`) and local Unix sockets, which do not depend on the pod IP.
 
-### Test 9: Snapshot and Restore While Skipping CUDA Configuration
+### 2.3 What the Customer Loses With Memory-Only
 
-**Objective**
+With candidate (a), GPU memory is copied, not dropped, so nothing measured was lost:
 
-To test whether we can take a snapshot of only files and system memory while skipping CUDA, or restore a snapshot without passing any CUDA configuration.
+- **Weights:** kept; no reload in any passing run.
+- **KV and prefix cache:** kept (the Triton vLLM backend continued its inference count). With `/pause`, vLLM resets the prefix cache.
+- **CUDA graphs and compiled kernels:** not measured, because the vLLM runs used `--enforce-eager`.
+- **Optimizer state and training step:** kept; training continued at step 26 with identical loss.
+- **Triton model readiness:** kept; the model stayed `READY` with no reload.
 
-**Test Execution and Results**
+The costs are a checkpoint that includes all GPU memory in use, the host memory needed during the pause, and the GPU setup time on restore.
 
-We evaluated two scenarios:
+### 2.4 How Far the GPU Can Change
 
-#### Scenario 1: Taking a Snapshot While Skipping CUDA
+| Target | Memory and CUDA state | Memory-only |
+|---|---|---|
+| Same card | Passed (all workloads tested) | Passed (training, Triton) |
+| Other card, same node | Fails, `status=0x1f` | Passed for training and the Triton embedding model |
+| Same GPU model, other node | Not tested | Not tested |
+| Other GPU model (RTX 5090 → RTX PRO 6000) | Not tested | Checkpoint copied to worker-4; restore not completed |
+| Other driver version | Not tested | Not tested (the RTX 5090 → RTX PRO 6000 move also changes the driver from 595 to 615) |
 
-We attempted to capture a snapshot of only files and system memory on an active GPU workload by intentionally omitting the `--cuda-checkpoint-path` flag.
+### 2.5 Host Memory With Memory-Only
 
-Because the workload was using the GPU, gVisor detected active NVIDIA device handles but had no utility to freeze VRAM. The checkpoint failed immediately with a runtime panic:
+A memory-only checkpoint does not remove host-memory sizing; the same 1.2× rule applies. `Qwen2.5-7B` in vLLM was `OOMKilled` with a 24 GiB limit and passed with 48 GiB. Image sizes are similar or larger: 18 GB for vLLM Qwen2.5-7B with both approaches, and 28 GB for the Triton vLLM backend against 19 GB with the memory and CUDA state checkpoint.
 
-**Observed Logs:**
+### 2.6 Constraints on Customer Workloads
 
-```text
-checkpoint failed: checkpointing container "8299eef405cc809eb93221e6740ed312d4aa2a9b845202bf8b934497367fbf97":
-encoding error: nvproxy: object handle 0xc1d02d06:0x5c00007e (class 0x00000079, type *nvproxy.miscObject) is not restorable:
+- Every process that holds a CUDA context must be suspended before the checkpoint.
+- Processes must not share GPU memory through CUDA IPC.
+- vLLM sleep mode cannot be used to offload the weights in vLLM 0.19.0.
+- Standalone vLLM does not yet survive the new pod IP after restore.
+- The workload must restart with the same claim name, command, args and filesystem layout.
 
-goroutine 587 [running]:
-gvisor.dev/gvisor/pkg/state.safely.func1()
-        pkg/state/state.go:309 +0x19e
-panic({0x12fc9a0?, 0x2158717b1340?})
-        GOROOT/src/runtime/panic.go:860 +0x13a
-gvisor.dev/gvisor/pkg/sentry/devices/nvproxy.(*nvproxy).beforeSave(0x421b5f?)
-        pkg/sentry/devices/nvproxy/save_restore.go:182 +0x1f9
-```
+### 2.7 Acceptance Criteria (Memory-Only PoC)
 
-#### Scenario 2: Restoring a GPU Snapshot While Skipping CUDA Configurations
+- **Restore onto a different physical GPU with correct output, or an explanation with exact errors:** done for training and the Triton embedding model. The Triton vLLM backend needs UUID confirmation. Standalone vLLM is explained (`miscObject … not restorable`, then `Broken pipe` on the new pod IP), and the `/pause` retry is not finished. Whisper is reported passed without a log.
+- **Compatibility table:** Section 2.4. The other-node, other-GPU-model and other-driver cells are still open.
+- **Time to first output and checkpoint size, compared with memory + CUDA and cold start:** Sections 3 and 4.
+- **Constraints on customer workloads:** Section 2.6.
 
-We took a valid GPU snapshot, but attempted to restore it into a Pod manifest where all GPU resource claims and the `/opt/cuda-checkpoint` mount were completely removed (attempting to restore only the files and memory without GPU configuration).
-
-During restore, gVisor validated the new Pod against the saved container specification. Because the original GPU mounts were missing, gVisor rejected the restore with `StartError`:
-
-**Observed Logs:**
-
-```text
-Events:
-  Type     Reason    Age   From     Message
-  ----     ------    ----  ----     -------
-  Warning  Failed    4s    kubelet  spec.containers{cuda}: Error: failed to start containerd task "cuda": OCI runtime restore failed: starting container: starting sub-container [/bin/bash]: failed to handle restore spec validation: failed to validate restore spec: failed to validate spec for container "cuda": "Mounts" does not match across checkpoint restore for container: "agent"
-```
-
-**Technical Analysis**
-
-This test demonstrates that CUDA handling cannot be bypassed or skipped at either stage:
-
-1. **At Checkpoint Time:** An active GPU workload cannot have its files and memory snapshotted while skipping CUDA. As long as a container uses the GPU, gVisor requires `--cuda-checkpoint-path` to freeze VRAM; without it, the checkpoint crashes immediately.
-2. **At Restore Time:** A snapshot captured from a GPU workload cannot be restored into a plain non-GPU container. gVisor enforces strict spec validation, requiring all original GPU volume mounts and resource claims to be present.
-
-**Result: FAIL**
-
-Skipping CUDA during snapshot or restore is completely unsupported. The `--cuda-checkpoint-path` flag is strictly required during checkpoint, and matching GPU mounts are strictly required during restore.
+**Out of scope for this PoC:** product API and scheduling.
 
 ---
 
-### Test 10: Multi-GPU Workload Checkpoint and Restore
+## 3. Benchmark
 
-**Objective**
+**Purpose:** give the design reproducible numbers for restore-mode defaults, checkpoint storage pricing, node host-memory sizing and the resume time promised to customers.
 
-To check whether a workload using both RTX 5090 GPUs can be checkpointed and restored.
+**Method required by the ticket:** run in-cluster against the same GPU nodes, at least 3 runs per cell, reporting median and p95. **This has not been done yet.** The numbers below come from one run each on worker-3, from the PoC runs above.
 
-**Test Execution and Results**
+| Workload | Cold start | Checkpoint time | Checkpoint size | Restore to healthy | Frozen time |
+|---|---|---|---|---|---|
+| Training, Qwen2.5-7B LoRA (memory-only, same card) | 1.95 s model load | 16 s | 22 GB | 8–12 s | ~135 s |
+| Training, Qwen2.5-7B LoRA (memory-only, other card) | — | — | — | 12 s | — |
+| Triton, embedding (memory-only) | — | — | — | 6 s | — |
+| Triton, vLLM backend (memory and CUDA state) | 141 s (89 s cached) | 18 s | 19 GB | 9 s | — |
+| Triton, vLLM backend (memory-only) | 141 s | — | 28 GB | — | — |
+| vLLM, Qwen2.5-7B, util 0.90 (memory and CUDA state) | — | 28 s | 18 GB | 5 s | — |
+| vLLM, Qwen2.5-7B, util 0.90 (memory-only) | — | 8 s | 18 GB | not completed | — |
+| vLLM, Whisper large-v3 (memory-only, no log) | 98 s | 4.41 s | — | 11.27 s | — |
+| vLLM, Qwen2.5-14B-AWQ, util 0.90, worker-4 | 236 s | failed (host memory) | — | — | — |
 
-1. A workload was started with a DRA ResourceClaim requesting two physical GPUs.
-2. PyTorch detected both devices as `cuda:0` and `cuda:1`.
-3. The workload allocated approximately 256 MB on each GPU and successfully executed the dual-GPU workload.
-4. The snapshot completed checkpoint creation in approximately 10 seconds, and the archive was saved to S3.
-5. The source Pod was deleted to release both GPUs.
-6. A restore Pod was deployed requesting two GPUs.
-7. The restore Pod entered `StartError`.
+"—" means not recorded.
 
-**Observed Logs:**
+**Observed so far:**
 
-```text
-Events:
-  Type     Reason    Age   From     Message
-  ----     ------    ----  ----     -------
-  Warning  Failed    18s   kubelet  spec.containers{cuda}: Error: failed to start containerd task "cuda": OCI runtime restore failed: starting container: starting sub-container: failed to get nvproxy device IDs: NV0000_CTRL_CMD_GPU_GET_ID_INFO for minor=0 gpuId=0x100 failed: status=0x1f
-```
+- Restore is a small fraction of cold start for the inference servers: 9 s against 141 s for the Triton vLLM backend (about 6%).
+- Checkpoint size follows the GPU memory in use, not the model size. Qwen2.5-7B has about 15 GB of weights, but its checkpoints are 18–28 GB because the KV-cache reservation is included.
 
-**Technical Analysis**
+**Matrix status:**
 
-Multi-GPU restore failed during gVisor `nvproxy` device initialization with error `NV0000_CTRL_CMD_GPU_GET_ID_INFO status=0x1f`.
+- **Workloads:** training, Triton and vLLM ~8B have at least one run; Whisper and the ~14–32B model are not finished.
+- **GPUs:** RTX 5090 only; the RTX PRO 6000 has no valid run yet.
+- **`gpu_memory_utilization` 0.5 and 0.9:** only 0.9 recorded.
+- **Checkpoint storage:** node-local NVMe only. The object store has not been measured; the only transfer recorded is a node-to-node copy of 18 GB in 173 s.
+- **Cold start, runc vs. gVisor:** gVisor only; no runc baseline.
+- **Pause:** compressed size and host-memory peak not measured.
+- **Resume, both modes:** measured as restore to healthy; time to first token or next training step only for training (under 2 s after unlock).
+- **Inference steady state (guidellm, perf_analyzer):** not run.
+- **Training steady state (samples/s, step time):** not run.
+- **Warm-up after resume (first 10 requests):** not run.
 
-In a multi-GPU setup, the checkpoint records specific device IDs, minor numbers, and internal hardware mappings for each physical GPU. During restore, gVisor must re-associate each saved GPU context with its matching physical card in the exact original sequence. Even though Kubernetes DRA allocated two identical GPUs to the restore Pod, the driver rejected device re-association (`minor=0 gpuId=0x100`) because multi-device ordering and hardware handle mappings could not be preserved across container recreation.
+**Acceptance criteria (Benchmark):**
 
-**Result: FAIL**
+- **One results table covering every cell, with raw logs:** not met; the table above is partial.
+- **Resume time as a percentage of cold start:** available only for the Triton vLLM backend (about 6%).
+- **Steady-state throughput gap between gVisor and runc:** not measured.
+- **Checkpoint size vs. model size vs. GPU memory in use, charted:** data exists for 4 workloads; the chart is not made.
+- **Re-runnable from a documented procedure in under a day:** procedures exist per workload in the source documents; a single benchmark procedure is not written.
 
----
-
-### Test 11: GPU Count Change During Restore
-
-**Objective**
-
-To check whether a workload checkpointed with one GPU can be restored using a target Pod requesting two GPUs.
-
-**Test Execution and Results**
-
-1. A workload was started with one GPU.
-2. The workload was checkpointed successfully.
-3. The target restore Pod was configured to request two GPUs using a DRA ResourceClaim with `count: 2`.
-4. The restore Pod entered `StartError`.
-
-**Observed Logs:**
-
-```text
-Events:
-  Type     Reason    Age   From     Message
-  ----     ------    ----  ----     -------
-  Warning  Failed    22s   kubelet  spec.containers{cuda}: Error: failed to start containerd task "cuda": OCI runtime restore failed: starting container: starting sub-container: failed to get nvproxy device IDs: NV0000_CTRL_CMD_GPU_GET_ID_INFO for minor=0 gpuId=0x100 failed: status=0x1f
-```
-
-**Technical Analysis**
-
-The checkpoint was created with a one-GPU configuration, while the restore Pod requested two GPUs. The restore operation failed during `nvproxy` device initialization.
-
-This test demonstrates that the tested workflow did not support changing the GPU count from one to two during restore. The observed error does not independently identify every internal device-topology mismatch; further testing would be required to determine the exact compatibility rules.
-
-**Result: FAIL**
-
-The tested one-GPU-to-two-GPU restore failed. The GPU configuration should be kept consistent between checkpoint and restore until additional testing establishes which GPU count changes, if any, are supported.
+**Results not used:** `MASTER_BENCHMARK_REPORT.md` and `TRADE_OFF_REPORT_RESTORE_MODES.md` list further numbers, including runc cold starts, compressed sizes, object-store times, worker-4 Triton and Whisper passes, a passing Qwen2.5-14B run at 0.38 utilization and an 11.2 s cross-node memory-only restore. These have no run logs, and several contradict the detailed reports, which record the same runs as in progress or not run. They are left out of this report until the runs are repeated with logs.
 
 ---
 
-## 5. Benchmarking Results
+## 4. Trade-off and Recommendation
 
-We evaluated checkpoint and restore performance on the NVIDIA GeForce RTX 5090 (32GB) across scaling GPU memory allocations (1 GiB, 8 GiB, and 24 GiB). Active GPU computing inside gVisor operates with **0.0% compute overhead**, matching native bare-metal execution speed (`219.60 TFLOPS` inside gVisor vs. `219.49 TFLOPS` natively).
+| | Memory and CUDA state | Memory-only |
+|---|---|---|
+| **Resume time** | 5 s (vLLM), 9 s (Triton vLLM backend) | 6 s (Triton embedding), 8–12 s (training) |
+| **What survives** | Weights, KV and prefix cache, optimizer state, processes | The same |
+| **In-flight requests** | Not recorded | Wait while CUDA is locked, then complete (Triton) |
+| **GPU placement** | Same card only (`status=0x1f` on any other) | Any card in the same node; other nodes and GPU models not yet proven |
+| **Checkpoint size** | GPU memory in use plus process memory (18–22 GB for a 7B model) | The same or larger |
+| **Host memory at pause** | Limit ≥ 1.2× GPU memory in use | The same |
+| **Customer constraints** | No CUDA IPC between processes | Every CUDA process suspended; vLLM needs `/pause` and does not yet survive a new pod IP |
+| **Failure modes seen** | Wrong card (`0x1f`), memory limit too low (`EOF`), changed mounts or args | A missed process (`miscObject`), broken socket on a new pod IP, memory limit too low (`OOMKilled`) |
+| **Bin-packing** | A paused workload pins one specific card | Any free card can be used on resume |
+| **Driver or runsc upgrade** | Not tested | Not tested |
+| **Security** | The checkpoint contains the customer's weights, prompts and KV cache | The same |
 
-| VRAM Allocation | Target Hardware | Checkpoint Duration | Restore Duration | Status |
-|---|---|:---:|:---:|:---:|
-| **1 GiB** (1,024 MB) | NVIDIA GeForce RTX 5090 (32 GiB) | **9.00 seconds** | **13.22 seconds** | `Ready` / Restored cleanly via CSI |
-| **8 GiB** (8,192 MB) | NVIDIA GeForce RTX 5090 (32 GiB) | **30.45 seconds** | **19.49 seconds** | `Ready` / Restored cleanly via CSI |
-| **24 GiB** (24,576 MB) | NVIDIA GeForce RTX 5090 (32 GiB) | **70.00 seconds** | **41.10 seconds** | `Ready` / Restored cleanly via CSI |
+**Compared with the alternatives:** a cold start keeps nothing and takes 89–236 s for the inference servers tested. Keeping the GPU allocated while idle resumes instantly, but the customer keeps paying and the card stays blocked. Pause is worthwhile whenever the model takes more than a few seconds to load.
+
+**Recommendation:**
+
+- **Offer one "Pause" action** to customers and do not expose the restore mode.
+- **Resume order:**
+  1. If the original card is free, restore the memory and CUDA state snapshot on it.
+  2. Otherwise, restore a memory-only snapshot on another card in the same node.
+  3. Otherwise, cold start.
+- **Make the memory-only checkpoint the default** once the operator can run `cuda-checkpoint` itself, because it frees the card and keeps every resume option open.
+- **Exclude at launch:**
+  - Multi-GPU workloads.
+  - Workloads that share GPU memory between processes through CUDA IPC.
+  - Cross-node and cross-GPU-model resume, until they are proven.
+  - Memory-only for standalone vLLM, until it survives a new pod IP.
+
+**Open risks for the design:**
+
+1. Host-memory sizing per node: on worker-4 the GPU is larger than the node's RAM.
+2. Encrypting and isolating checkpoints per tenant, since they contain weights and prompts.
+3. Whether checkpoints survive a driver or runsc upgrade.
+4. Operator automation of `cuda-checkpoint`: exec into every CUDA process, then verify the state.
+5. Deleting checkpoints when a paused runtime is deleted.
 
 ---
 
-## 6. Key Findings
+## Still to Run
 
-1. **Single-GPU vs. Multi-GPU:** Workloads running on a single GPU (1 card) checkpoint and restore reliably. Multi-GPU workloads can capture a checkpoint in 10 s, but restore fails during driver initialization (`status=0x1f`).
-2. **Multi-Process & Shared Memory Limitations:** Multi-process workloads sharing GPU memory via CUDA IPC fail during checkpointing (cannot freeze child processes; exit status 256). Workloads must run in single-process mode.
-3. **Same Physical GPU Required (No Cross-Card):** Checkpoints cannot be restored onto a different physical GPU card (`Card 1` $\to$ `Card 0` fails with `status=0x1f`). Workloads must be pinned to the original physical GPU device.
-4. **GPU Count Cannot Change:** Restoring a 1-GPU checkpoint into a container configured for 2 GPUs is rejected by gVisor device remapping.
-5. **Snapshot Time Scales with VRAM Size:** As allocated GPU memory increases, save and restore durations increase proportionally (1 GiB takes **9 s** checkpoint / **13 s** restore; 8 GiB takes **30 s** / **19 s**; 24 GiB takes **70 s** / **41 s**).
-6. **Container RAM Sizing:** Container host RAM must be sized equal to or greater than allocated GPU VRAM ($\ge 1.25\times\text{VRAM}$) to prevent Out-Of-Memory crashes (`EOF`) during snapshot staging.
-7. **Zero Compute Overhead (0.0%):** Active GPU computations run at exact bare-metal speed with zero performance penalty inside gVisor. Overhead exists only during container startup (~100–300 ms) and restore.
-8. **Storage Coordination:** Persistent disk volumes (Ceph PVC) must be paused before snapshotting to prevent live disk writes from drifting past the memory checkpoint.
+- **Training:**
+  - Rerun the worker-4 uninterrupted run with the same script.
+  - Run training with the memory and CUDA state checkpoint.
+  - Run 5 cycles, and a second uninterrupted run to measure run-to-run noise.
+  - Attach the raw logs (the uninterrupted log in `APPROACH_A_PYTORCH_TRAINING.md` comes from the pause script, and the restore log in `APPROACH_A_STATUS.md` starts at step 31).
+- **Triton:**
+  - Confirm the vLLM backend's target GPU by UUID.
+  - Send a real gRPC inference request.
+  - Run 5 cycles for the vLLM backend, and run on worker-4.
+- **vLLM:**
+  - Whisper: finish the memory and CUDA state checkpoint, compare transcripts, and attach the memory-only log.
+  - Qwen2.5-14B-AWQ at 0.38 utilization.
+  - Qwen2.5-7B: cold start, in-flight requests, 5 cycles, and worker-4.
+  - Finish the memory-only restore onto worker-4.
+- **All workloads:** passing host-memory data points on the RTX PRO 6000, and the full benchmark matrix in Section 3.
+
+---
+
+## Source Documents
+
+- Main reports: `REAL_WORKLOADS_MEMORY_CUDA_PAUSE_RESUME_REPORT.md` (memory and CUDA state) and `MEMORY_ONLY_RESTORE_REPORT.md` (memory-only)
+- Training: `APPROACH_A_PYTORCH_TRAINING.md`, `APPROACH_A_PYTORCH_TRAINING_WORKER4.md`, `APPROACH_A_STATUS.md`
+- Triton: `TRITON_MEMORY_CUDA_VS_MEMORY_ONLY_POC.md`, `TRITON_PYTORCH_LIBTORCH_POC.md`, `TRITON_PYTORCH_PYTHON_STUB_POC.md`
+- vLLM: `REAL_WORKLOAD_VLLM_REPORT.md`
+- PR #2409 baseline: `GPU_GVISOR_POC_REPORT.md`
