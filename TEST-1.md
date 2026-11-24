@@ -309,9 +309,7 @@ Testing revealed the following scenarios that affect host memory requirements:
 
 This test evaluates whether a paused GPU workload can be restored on a different physical GPU card within the same node (for example, Card 0 to Card 1 on worker-3). Before gVisor captures the container snapshot, CUDA checkpointing transfers GPU memory contents to CPU RAM. We evaluated two approaches to determine whether the workload can resume execution on a different GPU card without depending on the original GPU card.
 
-### Approach A: CUDA suspension with device remapping
-
-# Approach A: CUDA Suspension with Device Remapping
+### Approach A: CUDA suspension
 
 **Overview:** This approach suspends CUDA at the driver level without requiring any workload changes. Before taking the snapshot, `cuda-checkpoint` suspends the CUDA process and transfers GPU memory contents to CPU RAM. This allows the gVisor snapshot to preserve the complete process state, including GPU memory.
 
