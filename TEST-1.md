@@ -213,8 +213,8 @@ This test validates pause and resume functionality on Triton Inference Server us
 | ------------------------- | ----------------------------- | --------------------------- | -------------------- | --------------- | ------------------------ | ----------------- | ------------------ |
 | `text_embedding` (MiniLM) | **RTX 5090** (`worker-3`)     | **7 s**                 | **3.39 s**           | **508 MB**      | **3.6 s**               | ✅                 | ❌                  |
 | `text_embedding`          | **RTX PRO 6000** (`worker-4`) | **10.2 s**                  | **4.12 s (868 ms)**   | **508 MB**      | **4.7 s**              | ✅                 | ❌                  |
-| `Qwen2.5-7B` (vLLM)       | **RTX 5090** (`worker-3`)     | **131.46 ms** | **71.27 s (1m 11s)** | **18.0 GB**     | **4.3 s**                | ✅                 | ❌                  |
-| `Qwen2.5-7B` (vLLM)       | **RTX PRO 6000** (`worker-4`) | **160.78 ms**           | **18.0 s**           | **19.2 GB**     | **4.5 s**                | ✅                 | ❌                  |
+| `Qwen2.5-7B` (vLLM)       | **RTX 5090** (`worker-3`)     | **131.46 s** | **71.27 s (1m 11s)** | **18.0 GB**     | **4.3 s**                | ✅                 | ❌                  |
+| `Qwen2.5-7B` (vLLM)       | **RTX PRO 6000** (`worker-4`) | **160.78 s**           | **18.0 s**           | **19.2 GB**     | **4.5 s**                | ✅                 | ❌                  |
 ### **Multi-Cycle Checkpoint Stability Results (Triton LibTorch)**
 
 | Workload / Model                       | GPU Hardware              | Initial Base VRAM | 1st Ckpt VRAM | 2nd Ckpt VRAM | 3rd Ckpt VRAM | 4th Ckpt VRAM | 5th Ckpt VRAM | Memory Growth / Leak     |
