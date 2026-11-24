@@ -260,7 +260,7 @@ This test validates pause and resume functionality for vLLM workloads running in
 | Qwen2.5-7B (`util: 0.50`, 16.3 GB) | RTX 5090 (`worker-3`) | 29.1 s | 15.0 s | 19.0 GB | 3.55 s (3,551 ms) | 29.08 s | 3.45 s | ✅ | ❌ |
 | Qwen2.5-7B (`util: 0.90`, 28.8 GB) | RTX 5090 (`worker-3`) | 81.77 s | 17.42 s | 19.0 GB | 3.51 s  | 30.73 s| 119 ms | ✅ | ❌ |
 | Qwen2.5-7B (`util: 0.50`, 48.0 GB) | RTX PRO 6000 (`worker-4`) | 209.78 s | 18.0 s | 18.4 GB | 83.69 s | 25.96 s  | 978 ms | ✅ | ❌ |
-| Whisper large-v3 (`vllm-omni`) | RTX 5090 (`worker-3`) | 240.60 s | 6.34 s | 5.4 GB | 2.92 s | 84.02 s| Pending Resume | ✅ | ❌ |
+| Whisper large-v3 (`vllm-omni`) | RTX 5090 (`worker-3`) | 240.60 s | 6.34 s | 5.4 GB | 2.92 s | 84.02 s| _ | ✅ | ❌ |
 | Qwen2.5-14B-AWQ (`util: 0.90`, 86.4 GB) | RTX PRO 6000 (`worker-4`) | 236.0 s | ❌ Failed | 0 bytes | — | — | — | ❌ | ❌ |
 | Qwen2.5-14B-AWQ (`util: 0.38`, 36.5 GB) | RTX PRO 6000 (`worker-4`) | 34.0 s | 18.0 s | 26.0 GB | 8.5 s | 35.69 sec | 792 ms | ✅ | ❌ |
 
