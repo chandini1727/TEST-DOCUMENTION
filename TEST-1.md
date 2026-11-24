@@ -203,11 +203,9 @@ This test validates pause and resume functionality on Triton Inference Server us
 
 5. Restored the Triton Inference Server workloads using the captured checkpoints, testing restoration on both the same physical GPU cards and different physical GPU cards through restore annotations.
 
-6. Initiated the gVisor restore operation to recover the saved process memory and CUDA state without executing a separate CUDA restoration command inside the containers.
+6. Sent the same inference requests to the restored servers and compared the outputs with the pre-pause results, as shown in the Verification Check table. Repeated the `text_embedding` pause and resume cycle five times to check for memory growth.
 
-7. Sent the same inference requests to the restored servers and compared the outputs with the pre-pause results, as shown in the Verification Check table. Repeated the `text_embedding` pause and resume cycle five times to check for memory growth.
-
-8. Verified model readiness, inference availability, and server metrics after restoration to confirm that Triton Inference Server continued operating correctly.
+7. Verified model readiness, inference availability, and server metrics after restoration to confirm that Triton Inference Server continued operating correctly.
 
 #### Measured Metrics Table
 
