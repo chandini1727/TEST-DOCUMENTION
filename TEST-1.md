@@ -407,10 +407,10 @@ vLLM's sleep mode (`/sleep`) was also tested. It released only the KV cache (0.7
 | **Triton vLLM Backend** (`Qwen2.5-7B`) | **RTX 5090** (`worker-3`) | **19 GB** (`util: 0.50`) | **131.6 s** | **132.89 s** | **18.0 s** | 19.0 GB / 13.2 GB | **4.3 s** |
 | **Triton vLLM Backend** (`Qwen2.5-7B`) | **RTX PRO 6000** (`worker-4`)| **24.0 GB** (`util: 0.25`) | **160.4 s** | **170.9 s** | **18.0 s** | 19.2 GB / 13.4 GB | **4.5 s** |
 | **vLLM Audio** (`whisper-large-v3`) | **RTX 5090** (`worker-3`) | 4.0 GB | **88.0 s** | **98.0 s** | **6.0 s** | 7.6 GB / 4.8 GB | **4.0 s** |
-| **vLLM LLM ~8B** (`Qwen2.5-7B`) | **RTX 5090** (`worker-3`) | **16.3 GB** (`util: 0.50`) | **154.99.0 s** | **155.0 s** | **15.0 s** | 12.7.0 GB | **13.0 s** |
-| **vLLM LLM ~8B** (`Qwen2.5-7B`) | **RTX PRO 6000** (`worker-4`)| **48.0 GB** (`util: 0.50`) | **68.7 s** | **70.82 s** | **18.0 s** | 32.6 GB | **83.7 s** |
-| **vLLM LLM ~8B** (`Qwen2.5-7B`) | **RTX 5090** (`worker-3`) | **28.8 GB** (`util: 0.90`) | **92.93 s** | **93.89.0 s** | **28.0 s** | 19 GB | **5.0 s** |
-| **vLLM 14B AWQ** (`Qwen2.5-14B`) | **RTX PRO 6000** (`worker-4`)| **36.5 GB** (`util: 0.38`) | **56.4 s** | **57.0 s** | **18.0 s** | 26.0 GB | **8.5 s** |
+| **vLLM LLM ~8B** (`Qwen2.5-7B`) | **RTX 5090** (`worker-3`) | **16.3 GB** (`util: 0.50`) | **154.99.0 s** | **155.0 s** | **15.0 s** | 19  GB | **3.55 s** |
+| **vLLM LLM ~8B** (`Qwen2.5-7B`) | **RTX PRO 6000** (`worker-4`)| **48.0 GB** (`util: 0.50`) | **68.7 s** | **70.82 s** | **18.0 s** | 32.6 GB | **3.51 s** |
+| **vLLM LLM ~8B** (`Qwen2.5-7B`) | **RTX 5090** (`worker-3`) | **28.8 GB** (`util: 0.90`) | **92.93 s** | **93.89.0 s** | **28.0 s** | 19 GB | **2.92 s** |
+| **vLLM 14B AWQ** (`Qwen2.5-14B`) | **RTX PRO 6000** (`worker-4`)| **36.5 GB** (`util: 0.38`) | **56.4 s** | **57.0 s** | **18.0 s** | 26.0 GB | **4.5 s** |
 
 ---
 ## 4. Trade-Off Report: Memory + CUDA vs Memory-Only Restore
