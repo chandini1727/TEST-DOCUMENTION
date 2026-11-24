@@ -188,7 +188,7 @@ Repeat pause and resume cycles on both workers showed no drift. GPU memory retur
 
 This test validates pause and resume functionality on Triton Inference Server using two models and execution backends on Worker-3 and Worker-4:
 
-- **Text Embedding Model:** `text_embedding`, served using the PyTorch (LibTorch) backend, running in a single process.
+- **Text Embedding Model:** `text_embedding`, served using the PyTorch (LibTorch) backend.
 - **Qwen2.5-7B-Instruct:** Served using the vLLM backend with the vLLM engine.
 
 #### **Steps Executed**
