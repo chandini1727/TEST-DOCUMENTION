@@ -264,7 +264,7 @@ This test validates pause and resume functionality for vLLM workloads running in
 | Qwen2.5-14B-AWQ (`util: 0.90`, 86.4 GB) | RTX PRO 6000 (`worker-4`) | 236.0 s | ❌ Failed | 0 bytes | — | — | — | ❌ | ❌ |
 | Qwen2.5-14B-AWQ (`util: 0.38`, 36.5 GB) | RTX PRO 6000 (`worker-4`) | 34.0 s | 18.0 s | 26.0 GB | 8.5 s | 35.69 sec | 792 ms | ✅ | ❌ |
 
-❌ **Why Qwen2.5-14B-AWQ at `0.90` failed:** At this setting, vLLM reserves 86.4 GB of GPU memory, which must be copied into CPU memory during checkpointing. Along with the memory already used by the process, the total requirement exceeds 105 GB of RAM. However, Worker-4 has only 91.1 GiB of allocatable RAM. As a result, the checkpoint operation ran out of memory, and no snapshot was created (0 bytes).
+❌ **Why Qwen2.5-14B-AWQ at `0.90` failed:** At this setting, vLLM reserves 86.4 GB of GPU memory, which must be copied into CPU memory during checkpointing. Along with the memory already used by the process, the total requirement exceeds 105 GB of RAM. However, Worker-4 has only 91.1 GB of allocatable RAM. As a result, the checkpoint operation ran out of memory, and no snapshot was created (0 bytes).
 
 At `0.38`, vLLM reserves 36.5 GB of GPU memory, allowing the checkpoint and restore operations to complete successfully.
 
