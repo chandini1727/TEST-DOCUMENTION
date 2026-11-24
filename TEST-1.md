@@ -279,6 +279,13 @@ At `0.38`, vLLM reserves 36.5 GB of GPU memory, allowing the checkpoint and rest
 | Request in flight during pause completes after resume | ✅ | ✅ | ✅ |
 | No drift across repeat pause and resume cycles (GPU and host memory unchanged) | ✅ | ✅ | — |
 
+### **vLLM – Multi-Cycle Pause/Resume VRAM Stability**
+
+| Workload / Model                    | GPU                 | Initial VRAM | 1st Resume | 2nd Resume | 3rd Resume | 4th Resume | 5th Resume | Memory Growth |
+| ----------------------------------- | ------------------- | ------------ | ---------- | ---------- | ---------- | ---------- | ---------- | ------------- |
+| vLLM (`Qwen2.5-7B-Instruct`) | RTX 5090 (worker-3) | 16.3 GB     | 16.3 GB   | 16.3 GB   | 16.3 GB   | 16.3 GB   | 16.3 GB   | +0 GB (0%)    |
+
+
 ---
 
 ### 1.4 Host Memory Sizing Rules
@@ -394,21 +401,23 @@ vLLM's sleep mode (`/sleep`) was also tested. It released only the KV cache (0.7
 
 ---
 
-## 3. Comprehensive Benchmark Results Table
+I would keep the same benchmark table and convert the MiB/MB values to GB. I would also correct the Whisper row alignment so that each metric is under the right column.
 
-| Workload | GPU Hardware | VRAM / Memory Utilization | Pod Deploy Time (`runc`) | Pod Deploy Time (`gVisor`) | Checkpoint Time (NVMe) | Checkpoint Size (Raw / Zstd) | Resume Time |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **PyTorch LoRA Training** (`Qwen2.5-7B`) | **RTX 5090** (`worker-3`) | 21 GB | **36 sec s** | **34.8 s** | **16.0 s** | **21.0 GB** | **8.0 s** |
-| **PyTorch LoRA Training** (`Qwen2.5-7B`) | **RTX PRO 6000** (`worker-4`)| 28.6 GB | **35.2 s** | **37.1 s** | **19.3 s** | **21.0 GB** | **2.3 s** |
-| **Triton LibTorch** (`text_embedding`) | **RTX 5090** (`worker-3`) | 853 MB | **7 s** | **8 s** | **9 s** | **508 MB** | **3.52 s** |
-| **Triton LibTorch** (`text_embedding`) | **RTX PRO 6000** (`worker-4`)| 870 MB | **10 s s** | **8 s** | **11 s** | **508 MB** | **4.16 s** |
-| **Triton vLLM Backend** (`Qwen2.5-7B`) | **RTX 5090** (`worker-3`) | **19 GB** (`util: 0.50`) | **131.6 s** | **132.89 s** | **18.0 s** | 19.0 GB / 13.2 GB | **4.3 s** |
-| **Triton vLLM Backend** (`Qwen2.5-7B`) | **RTX PRO 6000** (`worker-4`)| **24.0 GB** (`util: 0.25`) | **160.4 s** | **170.9 s** | **18.0 s** | 19.2 GB / 13.4 GB | **4.5 s** |
-| **vLLM Audio** (`whisper-large-v3`) | **RTX 5090** (`worker-3`) | 4.0 GB | **88.0 s** | **98.0 s** | **6.0 s** | 7.6 GB / 4.8 GB | **4.0 s** |
-| **vLLM LLM ~8B** (`Qwen2.5-7B`) | **RTX 5090** (`worker-3`) | **16.3 GB** (`util: 0.50`) | **154.99.0 s** | **155.0 s** | **15.0 s** | 19  GB | **3.55 s** |
-| **vLLM LLM ~8B** (`Qwen2.5-7B`) | **RTX PRO 6000** (`worker-4`)| **48.0 GB** (`util: 0.50`) | **68.7 s** | **70.82 s** | **18.0 s** | 32.6 GB | **3.51 s** |
-| **vLLM LLM ~8B** (`Qwen2.5-7B`) | **RTX 5090** (`worker-3`) | **28.8 GB** (`util: 0.90`) | **92.93 s** | **93.89.0 s** | **28.0 s** | 19 GB | **2.92 s** |
-| **vLLM 14B AWQ** (`Qwen2.5-14B`) | **RTX PRO 6000** (`worker-4`)| **36.5 GB** (`util: 0.38`) | **56.4 s** | **57.0 s** | **18.0 s** | 26.0 GB | **4.5 s** |
+### **3. Comprehensive Benchmark Results Table**
+
+| Workload                                 | GPU Hardware              | VRAM / Memory Utilization | Pod Deploy Time (`runc`) | Pod Deploy Time (`gVisor`) | Checkpoint Time (NVMe) | Checkpoint Size  | Resume Time  |
+| ---------------------------------------- | ------------------------- | ------------------------- | ------------------------ | -------------------------- | ---------------------- | ---------------------------- | ------------ |
+| **PyTorch LoRA Training** (`Qwen2.5-7B`) | RTX 5090 (`worker-3`)     | 21 GB                     | 36 s                     | 34.8 s                     | 16.0 s                 | 21.0 GB                      | 8.0 s        |
+| **PyTorch LoRA Training** (`Qwen2.5-7B`) | RTX PRO 6000 (`worker-4`) | 28.6 GB                   | 35.2 s                   | 37.1 s                     | 19.3 s                 | 21.0 GB                      | 2.3 s        |
+| **Triton LibTorch** (`text_embedding`)   | RTX 5090 (`worker-3`)     | 0.853 GB                  | 7 s                      | 8 s                        | 9 s                    | 508 MB                       | 3.52 s       |
+| **Triton LibTorch** (`text_embedding`)   | RTX PRO 6000 (`worker-4`) | 0.870 GB                  | 10 s                     | 8 s                        | 11 s                   | 508 MB                       | 4.16 s       |
+| **Triton vLLM Backend** (`Qwen2.5-7B`)   | RTX 5090 (`worker-3`)     | 19 GB (`util: 0.50`)      | 131.6 s                  | 132.89 s                   | 18.0 s                 | 19.0 / 13.2 GB               | 4.3 s        |
+| **Triton vLLM Backend** (`Qwen2.5-7B`)   | RTX PRO 6000 (`worker-4`) | 24.0 GB (`util: 0.25`)    | 160.4 s                  | 170.9 s                    | 18.0 s                 | 19.2 / 13.4 GB               | 4.5 s        |
+| **vLLM Whisper** (`whisper-large-v3`)    | RTX 5090 (32 GB)          | 28.8 GB (`util: 0.90`)    |  151 s                  | 147.3 s                    | \~3.2 s                | 18.2 GB                 | 4.5 s |
+| **vLLM LLM \~8B** (`Qwen2.5-7B`)         | RTX 5090 (`worker-3`)     | 16.3 GB (`util: 0.50`)    | 154.99 s                 | 155.0 s                    | 15.0 s                 | 19 GB                        | 3.55 s       |
+| **vLLM LLM \~8B** (`Qwen2.5-7B`)         | RTX PRO 6000 (`worker-4`) | 48.0 GB (`util: 0.50`)    | 68.7 s                   | 70.82 s                    | 18.0 s                 | 32.6 GB                      | 3.51 s       |
+| **vLLM LLM \~8B** (`Qwen2.5-7B`)         | RTX 5090 (`worker-3`)     | 28.8 GB (`util: 0.90`)    | 92.93 s                  | 93.89 s                    | 28.0 s                 | 19 GB                        | 2.92 s       |
+| **vLLM 14B AWQ** (`Qwen2.5-14B`)         | RTX PRO 6000 (`worker-4`) | 36.5 GB (`util: 0.38`)    | 56.4 s                   | 57.0 s                     | 18.0 s                 | 26.0 GB                      | 4.5 s        |
 
 ---
 ## 4. Trade-Off Report: Memory + CUDA vs Memory-Only Restore
